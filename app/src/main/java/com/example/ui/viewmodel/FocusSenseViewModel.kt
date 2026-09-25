@@ -1,0 +1,257 @@
+package com.example.ui.viewmodel
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.example.data.model.ActivityLogEntity
+import com.example.data.model.DeviceEntity
+import com.example.data.model.FamilyGroupEntity
+import com.example.data.model.LocationPointEntity
+import com.example.data.model.ScheduleRuleEntity
+import com.example.data.model.UserEntity
+import com.example.data.repository.ActiveAppBlockInfo
+import com.example.data.repository.FocusSenseRepository
+import com.example.data.repository.SentinelEvent
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import java.util.UUID
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class FocusSenseViewModel(
+    private val repository: FocusSenseRepository
+) : ViewModel() {
+
+    // Current User Session
+    val currentUser: StateFlow<UserEntity?> = repository.currentUser
+    val selectedChildId: StateFlow<String> = repository.selectedChildId
+    val isNetworkConnected: StateFlow<Boolean> = repository.isNetworkConnected
+    val isSyncing: StateFlow<Boolean> = repository.isSyncing
+    val serverUrl: StateFlow<String> = repository.serverUrl
+    val eventStream = repository.eventStream
+
+    fun updateServerUrl(url: String) {
+        repository.updateServerUrl(url)
+    }
+
+    suspend fun testServerConnection(): Pair<Boolean, String> {
+        return repository.testServerConnection()
+    }
+
+    val familyGroup: StateFlow<FamilyGroupEntity?> = repository.familyGroup
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    val childrenUsers: StateFlow<List<UserEntity>> = repository.childrenUsers
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val parentUsers: StateFlow<List<UserEntity>> = repository.parentUsers
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val allUsers: StateFlow<List<UserEntity>> = repository.allUsers
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val allDevices: StateFlow<List<DeviceEntity>> = repository.allDevices
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val unsyncedLogsCount: StateFlow<Int> = repository.unsyncedLogsCount
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    val unsyncedLocationCount: StateFlow<Int> = repository.unsyncedLocationCount
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    // Dynamic child-dependent flows
+    val activityLogs: StateFlow<List<ActivityLogEntity>> = selectedChildId
+        .flatMapLatest { childId -> repository.getLogsForChild(childId) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val flaggedAlerts: StateFlow<List<ActivityLogEntity>> = selectedChildId
+        .flatMapLatest { childId -> repository.getFlaggedLogsForChild(childId) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val scheduleRules: StateFlow<List<ScheduleRuleEntity>> = selectedChildId
+        .flatMapLatest { childId -> repository.getRulesForChild(childId) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val latestLocation: StateFlow<LocationPointEntity?> = selectedChildId
+        .flatMapLatest { childId -> repository.getLatestLocationForChild(childId) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    val locationHistory: StateFlow<List<LocationPointEntity>> = selectedChildId
+        .flatMapLatest { childId -> repository.getLocationHistoryForChild(childId) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // Simulation feedback state
+    private val _isAnalyzingContent = MutableStateFlow(false)
+    val isAnalyzingContent: StateFlow<Boolean> = _isAnalyzingContent.asStateFlow()
+
+    private val _lastSimulatedLog = MutableStateFlow<ActivityLogEntity?>(null)
+    val lastSimulatedLog: StateFlow<ActivityLogEntity?> = _lastSimulatedLog.asStateFlow()
+
+    private val _activeRestrictionOverlay = MutableStateFlow<ActiveAppBlockInfo?>(null)
+    val activeRestrictionOverlay: StateFlow<ActiveAppBlockInfo?> = _activeRestrictionOverlay.asStateFlow()
+
+    fun switchUser(user: UserEntity) {
+        repository.switchUser(user)
+        if (user.role == "child") {
+            repository.setSelectedChild(user.userId)
+        }
+    }
+
+    fun selectChild(childId: String) {
+        repository.setSelectedChild(childId)
+    }
+
+    fun toggleNetwork(connected: Boolean) {
+        repository.toggleNetworkSimulation(connected)
+    }
+
+    fun syncData() {
+        viewModelScope.launch {
+            repository.syncOfflineQueue()
+        }
+    }
+
+    fun acknowledgeAlert(logId: String) {
+        viewModelScope.launch {
+            repository.acknowledgeAlert(logId)
+        }
+    }
+
+    fun removeLog(logId: String) {
+        viewModelScope.launch {
+            repository.removeVulnerableLog(logId)
+        }
+    }
+
+    fun addScheduleRule(
+        name: String,
+        category: String,
+        startTime: String,
+        endTime: String,
+        days: String,
+        restrictedPackages: String
+    ) {
+        viewModelScope.launch {
+            val rule = ScheduleRuleEntity(
+                ruleId = UUID.randomUUID().toString(),
+                childId = selectedChildId.value,
+                ruleName = name,
+                category = category,
+                startTime = startTime,
+                endTime = endTime,
+                dayOfWeek = days,
+                restrictedPackages = restrictedPackages,
+                isActive = true
+            )
+            repository.addScheduleRule(rule)
+        }
+    }
+
+    fun updateScheduleRule(rule: ScheduleRuleEntity) {
+        viewModelScope.launch {
+            repository.updateScheduleRule(rule)
+        }
+    }
+
+    fun deleteScheduleRule(ruleId: String) {
+        viewModelScope.launch {
+            repository.deleteScheduleRule(ruleId)
+        }
+    }
+
+    fun toggleRuleActive(ruleId: String, isActive: Boolean) {
+        viewModelScope.launch {
+            repository.toggleRuleActive(ruleId, isActive)
+        }
+    }
+
+    fun verifyParentPin(pin: String): Boolean {
+        // Parent PIN defaults to "1234"
+        val parent = parentUsers.value.firstOrNull()
+        val expectedPin = parent?.pin?.takeIf { it.isNotBlank() } ?: "1234"
+        return pin == expectedPin
+    }
+
+    fun updateParentPin(newPin: String) {
+        viewModelScope.launch {
+            val parent = parentUsers.value.firstOrNull() ?: return@launch
+            repository.updateParentPin(parent.userId, newPin)
+        }
+    }
+
+    fun simulateContentExtraction(
+        appName: String,
+        title: String,
+        text: String,
+        packageName: String = "com.simulation.app"
+    ) {
+        viewModelScope.launch {
+            _isAnalyzingContent.value = true
+            val log = repository.processExtractedContent(
+                childId = selectedChildId.value,
+                packageName = packageName,
+                appName = appName,
+                contentTitle = title,
+                extractedText = text
+            )
+            _lastSimulatedLog.value = log
+            _isAnalyzingContent.value = false
+        }
+    }
+
+    fun dismissLastSimulatedLog() {
+        _lastSimulatedLog.value = null
+    }
+
+    fun simulateRestrictedAppLaunch(packageName: String, appName: String) {
+        viewModelScope.launch {
+            val restriction = repository.checkAppRestriction(selectedChildId.value, packageName)
+            if (restriction.isBlocked) {
+                _activeRestrictionOverlay.value = restriction.copy(restrictedAppName = appName)
+            } else {
+                // If not currently blocked by time, test-launch with mock notice
+                _activeRestrictionOverlay.value = ActiveAppBlockInfo(
+                    isBlocked = true,
+                    ruleName = "Simulated Focus Block Test",
+                    category = "Study Mode",
+                    endTime = "18:00",
+                    restrictedAppName = appName
+                )
+            }
+        }
+    }
+
+    fun dismissRestrictionOverlay() {
+        _activeRestrictionOverlay.value = null
+    }
+
+    fun recordManualLocation(lat: Double, lng: Double, locationName: String) {
+        viewModelScope.launch {
+            repository.recordLocation(
+                childId = selectedChildId.value,
+                lat = lat,
+                lng = lng,
+                accuracy = 4.0f,
+                locationName = locationName
+            )
+        }
+    }
+}
+
+class FocusSenseViewModelFactory(
+    private val repository: FocusSenseRepository
+) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(FocusSenseViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return FocusSenseViewModel(repository) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}

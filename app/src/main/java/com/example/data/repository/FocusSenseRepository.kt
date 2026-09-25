@@ -115,6 +115,52 @@ class FocusSenseRepository(context: Context) {
     ): Result<UserEntity> = withContext(Dispatchers.IO) {
         try {
             val normalizedEmail = email.trim().lowercase()
+
+            // 1. Attempt to register on Central Server (Render / Supabase)
+            var serverParentUser: UserEntity? = null
+            try {
+                val api = com.example.data.remote.ApiClient.getService(_serverUrl.value)
+                val response = api.registerParent(
+                    com.example.data.remote.RegisterParentDto(
+                        name = name.trim(),
+                        family_name = familyName.trim(),
+                        email = normalizedEmail,
+                        password = password,
+                        pin = if (pin.isNotBlank()) pin.trim() else "1234"
+                    )
+                )
+                if (response.isSuccessful && response.body() != null) {
+                    val body = response.body()!!
+                    val group = FamilyGroupEntity(
+                        groupId = body.user.group_id,
+                        familyName = body.family_name.ifBlank { "${name.trim()}'s Family" }
+                    )
+                    db.familyGroupDao().insert(group)
+
+                    val parent = UserEntity(
+                        userId = body.user.user_id,
+                        groupId = body.user.group_id,
+                        email = body.user.email,
+                        password = password,
+                        role = body.user.role,
+                        name = body.user.name,
+                        pin = body.user.pin,
+                        avatar = body.user.avatar
+                    )
+                    db.userDao().insert(parent)
+                    serverParentUser = parent
+                }
+            } catch (e: Exception) {
+                // Server unavailable or offline -> fallback to local creation below
+            }
+
+            if (serverParentUser != null) {
+                prefs.edit().putString("saved_user_id", serverParentUser.userId).apply()
+                _currentUser.value = serverParentUser
+                return@withContext Result.success(serverParentUser)
+            }
+
+            // 2. Offline / Local Fallback
             val existing = db.userDao().getUserByEmail(normalizedEmail)
             if (existing != null) {
                 return@withContext Result.failure(Exception("An account with email '$normalizedEmail' already exists. Please sign in."))
@@ -158,9 +204,66 @@ class FocusSenseRepository(context: Context) {
     suspend fun signInParent(email: String, password: String): Result<UserEntity> = withContext(Dispatchers.IO) {
         try {
             val normalizedEmail = email.trim().lowercase()
+
+            // 1. Attempt Server Login (Render / Supabase)
+            try {
+                val api = com.example.data.remote.ApiClient.getService(_serverUrl.value)
+                val response = api.loginParent(
+                    com.example.data.remote.LoginParentDto(
+                        email = normalizedEmail,
+                        password = password
+                    )
+                )
+                if (response.isSuccessful && response.body() != null) {
+                    val body = response.body()!!
+                    val group = FamilyGroupEntity(
+                        groupId = body.user.group_id,
+                        familyName = body.family_name.ifBlank { "My Family" }
+                    )
+                    db.familyGroupDao().insert(group)
+
+                    val parent = UserEntity(
+                        userId = body.user.user_id,
+                        groupId = body.user.group_id,
+                        email = body.user.email,
+                        password = password,
+                        role = body.user.role,
+                        name = body.user.name,
+                        pin = body.user.pin,
+                        avatar = body.user.avatar
+                    )
+                    db.userDao().insert(parent)
+
+                    // Insert synced children
+                    val children = body.children.map { c ->
+                        UserEntity(
+                            userId = c.user_id,
+                            groupId = c.group_id,
+                            email = c.email,
+                            password = password,
+                            role = c.role,
+                            name = c.name,
+                            pin = c.pin,
+                            avatar = c.avatar
+                        )
+                    }
+                    if (children.isNotEmpty()) {
+                        db.userDao().insertAll(children)
+                        _selectedChildId.value = children.first().userId
+                    }
+
+                    prefs.edit().putString("saved_user_id", parent.userId).apply()
+                    _currentUser.value = parent
+                    return@withContext Result.success(parent)
+                }
+            } catch (e: Exception) {
+                // Server unavailable or offline -> fallback to local check
+            }
+
+            // 2. Offline / Local fallback check
             val user = db.userDao().getUserByEmail(normalizedEmail)
             if (user == null) {
-                return@withContext Result.failure(Exception("No account found for '$normalizedEmail'. Please create an account first."))
+                return@withContext Result.failure(Exception("No account found for '$normalizedEmail'. Please verify credentials or create an account."))
             }
             if (user.password != password) {
                 return@withContext Result.failure(Exception("Incorrect password. Please verify and try again."))
@@ -185,10 +288,51 @@ class FocusSenseRepository(context: Context) {
     ): Result<UserEntity> = withContext(Dispatchers.IO) {
         try {
             val normalizedParentEmail = parentEmail.trim().lowercase()
-            var parentUser = db.userDao().getUserByEmail(normalizedParentEmail)
 
-            // If parent not in local DB (e.g. running on separate physical child device),
-            // initialize the parent & family record locally linked with parent's email credentials.
+            // 1. Attempt Server Device Pairing (Render / Supabase)
+            try {
+                val api = com.example.data.remote.ApiClient.getService(_serverUrl.value)
+                val response = api.pairChildDevice(
+                    com.example.data.remote.PairChildDto(
+                        parent_email = normalizedParentEmail,
+                        parent_password = parentPassword,
+                        child_name = childName.trim(),
+                        device_name = if (deviceName.isNotBlank()) deviceName.trim() else "${childName.trim()}'s Phone"
+                    )
+                )
+                if (response.isSuccessful && response.body() != null) {
+                    val body = response.body()!!
+                    val childUser = UserEntity(
+                        userId = body.child_user.user_id,
+                        groupId = body.group_id,
+                        email = body.child_user.email,
+                        password = parentPassword,
+                        role = "child",
+                        name = body.child_user.name,
+                        pin = ""
+                    )
+                    db.userDao().insert(childUser)
+
+                    val childDevice = DeviceEntity(
+                        deviceId = body.device_id,
+                        userId = childUser.userId,
+                        deviceName = if (deviceName.isNotBlank()) deviceName.trim() else "${childName.trim()}'s Phone",
+                        batteryPercent = 95,
+                        isOnline = true
+                    )
+                    db.deviceDao().insert(childDevice)
+
+                    prefs.edit().putString("saved_user_id", childUser.userId).apply()
+                    _currentUser.value = childUser
+                    _selectedChildId.value = childUser.userId
+                    return@withContext Result.success(childUser)
+                }
+            } catch (e: Exception) {
+                // Server unavailable or offline -> fallback to local creation
+            }
+
+            // 2. Offline Local Creation Fallback
+            var parentUser = db.userDao().getUserByEmail(normalizedParentEmail)
             val groupId = if (parentUser != null) {
                 if (parentUser.password != parentPassword) {
                     return@withContext Result.failure(Exception("Parent password incorrect. Cannot link device."))

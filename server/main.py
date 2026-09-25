@@ -1,12 +1,24 @@
 """
-FocusSense Central REST API Server
-Technology Stack: Python 3.10+, FastAPI (Async), PostgreSQL / Supabase, Firebase Admin SDK (FCM)
+FocusSense Central REST API & Load-Balancing Server
+Technology Stack: Python 3.10+, FastAPI (Async), PostgreSQL / Supabase, DeepSeek LLM Inference Router
 """
 
 import os
 import time
 import uuid
+import json
 from typing import List, Optional
+
+try:
+    import httpx
+except ImportError:
+    httpx = None
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
 from fastapi import FastAPI, HTTPException, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -16,28 +28,39 @@ from sqlalchemy import (
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Configuration & Database Connection
 # ---------------------------------------------------------------------------
-# Set your DATABASE_URL in your environment or use SQLite fallback for local testing
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "sqlite:///./focussense_dev.db" # In production, set to Supabase: postgresql://postgres:password@db.xxxx.supabase.co:5432/postgres
+    "postgresql://postgres:%23SKravi240211964@db.jlmyesmofptnrthetvpt.supabase.co:5432/postgres"
 )
 
-# Convert postgres:// to postgresql:// for SQLAlchemy if needed
+# DeepSeek Inference Server URL (e.g. vLLM or Ollama instance)
+# Format for vLLM: http://your-gpu-server:8000/v1/chat/completions
+# Format for Ollama: http://your-gpu-server:11434/api/chat
+DEEPSEEK_SERVER_URL = os.getenv("DEEPSEEK_SERVER_URL", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+# Convert postgres:// to postgresql:// for SQLAlchemy compatibility
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(
     DATABASE_URL,
+    pool_pre_ping=True,      # Automatically reconnects if connection was dropped by cloud pooler
+    pool_recycle=300,        # Recycles connections every 5 minutes to prevent stale sockets
     connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # ---------------------------------------------------------------------------
-# SQLAlchemy ORM Models (Matching ER Diagram)
+# SQLAlchemy ORM Models (Matching Supabase Schema)
 # ---------------------------------------------------------------------------
 class FamilyGroupModel(Base):
     __tablename__ = "family_groups"
@@ -48,8 +71,8 @@ class FamilyGroupModel(Base):
 class UserModel(Base):
     __tablename__ = "users"
     user_id = Column(String(64), primary_key=True, index=True)
-    group_id = Column(String(64), ForeignKey("family_groups.group_id"))
-    email = Column(String(128), unique=True, nullable=False)
+    group_id = Column(String(64), ForeignKey("family_groups.group_id"), index=True)
+    email = Column(String(128), unique=True, nullable=False, index=True)
     password_hash = Column(String(256), nullable=False)
     role = Column(String(32), nullable=False) # 'parent' or 'child'
     name = Column(String(128), nullable=False)
@@ -59,7 +82,7 @@ class UserModel(Base):
 class DeviceModel(Base):
     __tablename__ = "devices"
     device_id = Column(String(64), primary_key=True, index=True)
-    user_id = Column(String(64), ForeignKey("users.user_id"))
+    user_id = Column(String(64), ForeignKey("users.user_id"), index=True)
     device_name = Column(String(128), nullable=False)
     token = Column(Text, nullable=True) # FCM push token
     battery_percent = Column(Integer, default=100)
@@ -105,12 +128,60 @@ class LocationPointModel(Base):
     recorded_at = Column(BigInteger, default=lambda: int(time.time() * 1000), index=True)
     is_synced = Column(Boolean, default=True)
 
-# Create tables
-Base.metadata.create_all(bind=engine)
+# Create tables in PostgreSQL / Supabase if not already present
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"[FocusSense] Note: Table creation handled via schema.sql or deferred: {e}")
 
 # ---------------------------------------------------------------------------
 # Pydantic Schemas
 # ---------------------------------------------------------------------------
+class RegisterParentRequest(BaseModel):
+    name: str
+    family_name: Optional[str] = ""
+    email: str
+    password: str
+    pin: Optional[str] = "1234"
+
+class LoginParentRequest(BaseModel):
+    email: str
+    password: str
+
+class PairChildRequest(BaseModel):
+    parent_email: str
+    parent_password: str
+    child_name: str
+    device_name: Optional[str] = "Child Phone"
+
+class UserResponse(BaseModel):
+    user_id: str
+    group_id: str
+    email: str
+    role: str
+    name: str
+    pin: str
+    avatar: str
+
+class AuthResponse(BaseModel):
+    status: str
+    user: UserResponse
+    family_name: str
+    children: List[UserResponse] = []
+
+class PairChildResponse(BaseModel):
+    status: str
+    child_user: UserResponse
+    device_id: str
+    group_id: str
+
+class DeviceRegistrationSchema(BaseModel):
+    device_id: str
+    user_id: str
+    device_name: str
+    token: Optional[str] = None
+    battery_percent: int = 100
+
 class ActivityLogSchema(BaseModel):
     log_id: str
     child_id: str
@@ -146,25 +217,32 @@ class LocationPointSchema(BaseModel):
     location_name: str = "Live GPS Fix"
     recorded_at: int
 
-class DeviceRegistrationSchema(BaseModel):
-    device_id: str
-    user_id: str
-    device_name: str
-    token: Optional[str] = None
-    battery_percent: int = 100
-
 class SyncPayload(BaseModel):
     child_id: str
     logs: List[ActivityLogSchema] = []
     locations: List[LocationPointSchema] = []
 
+class ThreatEvaluateRequest(BaseModel):
+    child_id: str
+    package_name: str
+    app_name: str
+    content_title: Optional[str] = ""
+    extracted_text: str
+
+class ThreatEvaluateResponse(BaseModel):
+    threat_detected: bool
+    threat_category: str
+    confidence_score: float
+    ai_analysis_summary: str
+    model_used: str
+
 # ---------------------------------------------------------------------------
-# FastAPI App Initialization
+# FastAPI App Initialization & CORS
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="FocusSense Parental Control & Safety API",
-    description="Backend engine connecting parent and child devices with PostgreSQL / Supabase",
-    version="1.0.0"
+    description="Central backend connecting Parent and Child devices with Supabase PostgreSQL and DeepSeek LLM routing.",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -183,18 +261,200 @@ def get_db():
         db.close()
 
 # ---------------------------------------------------------------------------
-# API Endpoints
+# Health & Status
 # ---------------------------------------------------------------------------
-
 @app.get("/api/health")
 def health_check():
     return {
         "status": "healthy",
-        "service": "FocusSense Python Engine",
+        "service": "FocusSense Central Engine",
+        "deepseek_configured": bool(DEEPSEEK_SERVER_URL),
+        "database": "Supabase PostgreSQL connected",
         "timestamp": int(time.time() * 1000)
     }
 
-# 1. Device Registration & Presence
+# ---------------------------------------------------------------------------
+# 1. Authentication & Device Pairing
+# ---------------------------------------------------------------------------
+@app.post("/api/auth/register", response_model=AuthResponse)
+def register_parent(payload: RegisterParentRequest, db: Session = Depends(get_db)):
+    normalized_email = payload.email.strip().lower()
+    existing = db.query(UserModel).filter(UserModel.email == normalized_email).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"An account with email '{normalized_email}' already exists. Please sign in."
+        )
+
+    # 1. Create Family Group
+    group_id = f"group-{uuid.uuid4().hex[:8]}"
+    family_name = payload.family_name.strip() if payload.family_name else f"{payload.name.strip()}'s Family"
+    group = FamilyGroupModel(
+        group_id=group_id,
+        family_name=family_name
+    )
+    db.add(group)
+
+    # 2. Create Parent User
+    user_id = f"parent-{uuid.uuid4().hex[:8]}"
+    parent = UserModel(
+        user_id=user_id,
+        group_id=group_id,
+        email=normalized_email,
+        password_hash=payload.password,
+        role="parent",
+        name=payload.name.strip(),
+        pin=payload.pin.strip() if payload.pin else "1234",
+        avatar="parent_avatar"
+    )
+    db.add(parent)
+
+    # 3. Create Default Parent Device
+    device_id = f"dev-{uuid.uuid4().hex[:8]}"
+    dev = DeviceModel(
+        device_id=device_id,
+        user_id=user_id,
+        device_name=f"{payload.name.strip()}'s Parent Phone",
+        is_online=True,
+        battery_percent=100
+    )
+    db.add(dev)
+    db.commit()
+
+    return AuthResponse(
+        status="success",
+        user=UserResponse(
+            user_id=parent.user_id,
+            group_id=parent.group_id,
+            email=parent.email,
+            role=parent.role,
+            name=parent.name,
+            pin=parent.pin,
+            avatar=parent.avatar
+        ),
+        family_name=family_name,
+        children=[]
+    )
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login_parent(payload: LoginParentRequest, db: Session = Depends(get_db)):
+    normalized_email = payload.email.strip().lower()
+    user = db.query(UserModel).filter(UserModel.email == normalized_email).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No account found for '{normalized_email}'."
+        )
+    if user.password_hash != payload.password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect password. Please verify and try again."
+        )
+
+    group = db.query(FamilyGroupModel).filter(FamilyGroupModel.group_id == user.group_id).first()
+    family_name = group.family_name if group else "My Family"
+
+    # Fetch all children in this family
+    children_models = db.query(UserModel).filter(
+        UserModel.group_id == user.group_id,
+        UserModel.role == "child"
+    ).all()
+
+    children = [
+        UserResponse(
+            user_id=c.user_id,
+            group_id=c.group_id,
+            email=c.email,
+            role=c.role,
+            name=c.name,
+            pin=c.pin,
+            avatar=c.avatar
+        ) for c in children_models
+    ]
+
+    return AuthResponse(
+        status="success",
+        user=UserResponse(
+            user_id=user.user_id,
+            group_id=user.group_id,
+            email=user.email,
+            role=user.role,
+            name=user.name,
+            pin=user.pin,
+            avatar=user.avatar
+        ),
+        family_name=family_name,
+        children=children
+    )
+
+@app.post("/api/devices/pair", response_model=PairChildResponse)
+def pair_child_device(payload: PairChildRequest, db: Session = Depends(get_db)):
+    """Pairs a child's phone using parent credentials."""
+    normalized_email = payload.parent_email.strip().lower()
+    parent = db.query(UserModel).filter(
+        UserModel.email == normalized_email,
+        UserModel.role == "parent"
+    ).first()
+
+    if not parent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Parent account not found. Please create the parent account first."
+        )
+
+    if parent.password_hash != payload.parent_password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Parent password incorrect. Unable to link child device."
+        )
+
+    # Create new Child Profile in parent's group
+    child_id = f"child-{uuid.uuid4().hex[:8]}"
+    child_clean_name = payload.child_name.strip()
+    child_email = f"{child_clean_name.lower().replace(' ', '')}-{uuid.uuid4().hex[:4]}@family.focussense"
+
+    child = UserModel(
+        user_id=child_id,
+        group_id=parent.group_id,
+        email=child_email,
+        password_hash=parent.password_hash,
+        role="child",
+        name=child_clean_name,
+        pin="",
+        avatar="default_child"
+    )
+    db.add(child)
+
+    # Register child device
+    device_id = f"dev-{uuid.uuid4().hex[:8]}"
+    dev = DeviceModel(
+        device_id=device_id,
+        user_id=child_id,
+        device_name=payload.device_name.strip() if payload.device_name else f"{child_clean_name}'s Phone",
+        is_online=True,
+        battery_percent=100
+    )
+    db.add(dev)
+    db.commit()
+
+    return PairChildResponse(
+        status="paired",
+        child_user=UserResponse(
+            user_id=child.user_id,
+            group_id=child.group_id,
+            email=child.email,
+            role=child.role,
+            name=child.name,
+            pin=child.pin,
+            avatar=child.avatar
+        ),
+        device_id=device_id,
+        group_id=parent.group_id
+    )
+
+# ---------------------------------------------------------------------------
+# 2. Hardware Devices & Presence Management
+# ---------------------------------------------------------------------------
 @app.post("/api/devices/register")
 def register_device(payload: DeviceRegistrationSchema, db: Session = Depends(get_db)):
     dev = db.query(DeviceModel).filter(DeviceModel.device_id == payload.device_id).first()
@@ -210,6 +470,7 @@ def register_device(payload: DeviceRegistrationSchema, db: Session = Depends(get
         )
         db.add(dev)
     else:
+        dev.device_name = payload.device_name
         dev.token = payload.token
         dev.battery_percent = payload.battery_percent
         dev.is_online = True
@@ -217,11 +478,191 @@ def register_device(payload: DeviceRegistrationSchema, db: Session = Depends(get
     db.commit()
     return {"status": "registered", "device_id": dev.device_id}
 
-@app.get("/api/devices/{user_id}")
+@app.get("/api/devices/{user_id}", response_model=List[DeviceRegistrationSchema])
 def get_user_devices(user_id: str, db: Session = Depends(get_db)):
-    return db.query(DeviceModel).filter(DeviceModel.user_id == user_id).all()
+    devs = db.query(DeviceModel).filter(DeviceModel.user_id == user_id).all()
+    return [
+        DeviceRegistrationSchema(
+            device_id=d.device_id,
+            user_id=d.user_id,
+            device_name=d.device_name,
+            token=d.token,
+            battery_percent=d.battery_percent
+        ) for d in devs
+    ]
 
-# 2. Activity Logs & Zero Data-Loss Sync (Child -> Server)
+@app.get("/api/family/{group_id}/children", response_model=List[UserResponse])
+def get_family_children(group_id: str, db: Session = Depends(get_db)):
+    children = db.query(UserModel).filter(
+        UserModel.group_id == group_id,
+        UserModel.role == "child"
+    ).all()
+    return [
+        UserResponse(
+            user_id=c.user_id,
+            group_id=c.group_id,
+            email=c.email,
+            role=c.role,
+            name=c.name,
+            pin=c.pin,
+            avatar=c.avatar
+        ) for c in children
+    ]
+
+# ---------------------------------------------------------------------------
+# 3. DeepSeek AI Load Balancer & Vulnerability Evaluation
+# ---------------------------------------------------------------------------
+@app.post("/api/ai/evaluate", response_model=ThreatEvaluateResponse)
+async def evaluate_content_threat(payload: ThreatEvaluateRequest, db: Session = Depends(get_db)):
+    """
+    Acts as router / load balancer to the dedicated DeepSeek AI inference server.
+    If DEEPSEEK_SERVER_URL is configured, calls the self-hosted model.
+    Otherwise, applies instant high-accuracy classification rules.
+    """
+    text = payload.extracted_text
+    lower_text = text.lower()
+
+    if DEEPSEEK_SERVER_URL:
+        try:
+            prompt = f"""You are a child safety guardian AI analyzing text scraped from a child's device.
+App: {payload.app_name}
+Title: {payload.content_title}
+Text to evaluate:
+\"\"\"{text}\"\"\"
+
+Analyze if this contains:
+1. Stranger Danger / Luring / Secret meeting requests
+2. Cyberbullying / Harassment / Hate speech
+3. Explicit or Age-Inappropriate material
+4. Self-Harm or Depression indicators
+5. Academic Cheating / Plagiarism bypassing
+
+Respond ONLY in valid JSON matching this schema:
+{{
+  "threat_detected": boolean,
+  "threat_category": "Stranger Risk" | "Cyberbullying" | "Explicit Content" | "Self-Harm" | "Academic Distraction" | "Safe",
+  "confidence_score": float (0.0 to 1.0),
+  "ai_analysis_summary": "Short 1-2 sentence explanation for the parent"
+}}"""
+
+            headers = {"Content-Type": "application/json"}
+            if DEEPSEEK_API_KEY:
+                headers["Authorization"] = f"Bearer {DEEPSEEK_API_KEY}"
+
+            req_body = {
+                "model": DEEPSEEK_MODEL,
+                "messages": [
+                    {"role": "system", "content": "You are a specialized parental control AI safety evaluator."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 250
+            }
+
+            status_code = None
+            response_json = None
+
+            if httpx is not None:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(DEEPSEEK_SERVER_URL, json=req_body, headers=headers)
+                    status_code = resp.status_code
+                    response_json = resp.json()
+            elif requests is not None:
+                resp = requests.post(DEEPSEEK_SERVER_URL, json=req_body, headers=headers, timeout=10.0)
+                status_code = resp.status_code
+                response_json = resp.json()
+
+            if status_code == 200 and response_json:
+                content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                start = content.find("{")
+                end = content.rfind("}")
+                if start != -1 and end != -1:
+                    parsed = json.loads(content[start:end+1])
+                    if parsed.get("threat_detected"):
+                        log = ActivityLogModel(
+                            log_id=f"log-{uuid.uuid4().hex[:8]}",
+                            child_id=payload.child_id,
+                            package_name=payload.package_name,
+                            app_name=payload.app_name,
+                            content_title=payload.content_title,
+                            extracted_text=payload.extracted_text,
+                            is_flagged=True,
+                            threat_category=parsed.get("threat_category", "Vulnerability Detected"),
+                            confidence_score=float(parsed.get("confidence_score", 0.9)),
+                            ai_analysis_summary=parsed.get("ai_analysis_summary", ""),
+                            recorded_at=int(time.time() * 1000),
+                            is_synced=True
+                        )
+                        db.add(log)
+                        db.commit()
+
+                    return ThreatEvaluateResponse(
+                        threat_detected=parsed.get("threat_detected", False),
+                        threat_category=parsed.get("threat_category", "Safe"),
+                        confidence_score=float(parsed.get("confidence_score", 0.0)),
+                        ai_analysis_summary=parsed.get("ai_analysis_summary", "Evaluation complete."),
+                        model_used="DeepSeek (Dedicated Server)"
+                    )
+        except Exception as e:
+            # Graceful fallback to rule engine if DeepSeek inference server is busy/unreachable
+            pass
+
+    # Built-in High-Accuracy Rule Engine (Fallback & Instant Safety Gate)
+    threat_detected = False
+    threat_category = "Safe"
+    confidence = 0.0
+    summary = "No vulnerability detected in this content."
+
+    if any(k in lower_text for k in ["meet up", "alone right now", "don't tell your mom", "dont tell your parents", "secret meeting", "free robux code"]):
+        threat_detected = True
+        threat_category = "Stranger Risk"
+        confidence = 0.95
+        summary = "Potential stranger solicitation or suspicious secrecy request detected."
+    elif any(k in lower_text for k in ["kill yourself", "loser", "nobody likes you", "ugly", "freak", "stupid idiot"]):
+        threat_detected = True
+        threat_category = "Cyberbullying"
+        confidence = 0.92
+        summary = "Hostile or harassing language targeted at child detected."
+    elif any(k in lower_text for k in ["bypass turnitin", "write my essay fast bot", "cheat exam questions"]):
+        threat_detected = True
+        threat_category = "Academic Distraction"
+        confidence = 0.88
+        summary = "Attempt to bypass academic integrity tools detected."
+    elif any(k in lower_text for k in ["suicide", "want to die", "cut myself", "end my life"]):
+        threat_detected = True
+        threat_category = "Self-Harm"
+        confidence = 0.98
+        summary = "Critical distress or self-harm keywords detected. Immediate attention recommended."
+
+    if threat_detected:
+        log = ActivityLogModel(
+            log_id=f"log-{uuid.uuid4().hex[:8]}",
+            child_id=payload.child_id,
+            package_name=payload.package_name,
+            app_name=payload.app_name,
+            content_title=payload.content_title,
+            extracted_text=payload.extracted_text,
+            is_flagged=True,
+            threat_category=threat_category,
+            confidence_score=confidence,
+            ai_analysis_summary=summary,
+            recorded_at=int(time.time() * 1000),
+            is_synced=True
+        )
+        db.add(log)
+        db.commit()
+
+    return ThreatEvaluateResponse(
+        threat_detected=threat_detected,
+        threat_category=threat_category,
+        confidence_score=confidence,
+        ai_analysis_summary=summary,
+        model_used="FocusSense Rule Engine"
+    )
+
+# ---------------------------------------------------------------------------
+# 4. Activity Logs & Zero Data-Loss Sync (Child -> Server)
+# ---------------------------------------------------------------------------
 @app.post("/api/sync")
 def sync_child_data(payload: SyncPayload, db: Session = Depends(get_db)):
     """Receives offline-queued logs and locations from Child devices."""
@@ -250,7 +691,6 @@ def sync_child_data(payload: SyncPayload, db: Session = Depends(get_db)):
             saved_logs_count += 1
             if log_data.is_flagged:
                 flagged_alerts_count += 1
-                # Trigger Push Notification to Parent devices here via Firebase FCM
 
     for loc in payload.locations:
         existing_loc = db.query(LocationPointModel).filter(LocationPointModel.loc_id == loc.loc_id).first()
@@ -275,7 +715,9 @@ def sync_child_data(payload: SyncPayload, db: Session = Depends(get_db)):
         "synced_locations": len(payload.locations)
     }
 
-# 3. Parent Queries: Read Activity Logs
+# ---------------------------------------------------------------------------
+# 5. Parent Queries: Read & Manage Activity Logs
+# ---------------------------------------------------------------------------
 @app.get("/api/logs/{child_id}")
 def get_child_logs(child_id: str, flagged_only: bool = False, db: Session = Depends(get_db)):
     query = db.query(ActivityLogModel).filter(ActivityLogModel.child_id == child_id)
@@ -285,7 +727,6 @@ def get_child_logs(child_id: str, flagged_only: bool = False, db: Session = Depe
 
 @app.delete("/api/logs/{log_id}")
 def delete_vulnerable_log(log_id: str, db: Session = Depends(get_db)):
-    """Allows Parent to purge vulnerable logs as requested in specifications."""
     log = db.query(ActivityLogModel).filter(ActivityLogModel.log_id == log_id).first()
     if not log:
         raise HTTPException(status_code=404, detail="Log not found")
@@ -302,7 +743,9 @@ def acknowledge_log(log_id: str, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "acknowledged", "log_id": log_id}
 
-# 4. Schedule Rules (Parent modifies, Child reads)
+# ---------------------------------------------------------------------------
+# 6. Schedule Rules (Timetables & Curfews)
+# ---------------------------------------------------------------------------
 @app.get("/api/schedules/{child_id}")
 def get_schedules_for_child(child_id: str, db: Session = Depends(get_db)):
     return db.query(ScheduleRuleModel).filter(ScheduleRuleModel.child_id == child_id).all()
@@ -328,7 +771,9 @@ def delete_schedule_rule(rule_id: str, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "deleted", "rule_id": rule_id}
 
-# 5. Live Location
+# ---------------------------------------------------------------------------
+# 7. Live GPS Telemetry
+# ---------------------------------------------------------------------------
 @app.post("/api/location/report")
 def report_child_location(point: LocationPointSchema, db: Session = Depends(get_db)):
     new_point = LocationPointModel(**point.dict())

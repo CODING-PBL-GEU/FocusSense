@@ -3,6 +3,8 @@ package com.example.data.remote
 import com.example.data.model.ActivityLogEntity
 import com.example.data.model.LocationPointEntity
 import com.example.data.model.ScheduleRuleEntity
+import com.squareup.moshi.Moshi
+import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Response
@@ -16,6 +18,67 @@ import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
 import java.util.concurrent.TimeUnit
+
+// Auth & Pairing DTOs
+data class UserDto(
+    val user_id: String,
+    val group_id: String,
+    val email: String,
+    val role: String,
+    val name: String,
+    val pin: String = "1234",
+    val avatar: String = "default"
+)
+
+data class RegisterParentDto(
+    val name: String,
+    val family_name: String = "",
+    val email: String,
+    val password: String,
+    val pin: String = "1234"
+)
+
+data class LoginParentDto(
+    val email: String,
+    val password: String
+)
+
+data class AuthResponseDto(
+    val status: String,
+    val user: UserDto,
+    val family_name: String = "",
+    val children: List<UserDto> = emptyList()
+)
+
+data class PairChildDto(
+    val parent_email: String,
+    val parent_password: String,
+    val child_name: String,
+    val device_name: String = "Child Phone"
+)
+
+data class PairChildResponseDto(
+    val status: String,
+    val child_user: UserDto,
+    val device_id: String,
+    val group_id: String
+)
+
+data class ThreatEvaluateRequestDto(
+    val child_id: String,
+    val package_name: String,
+    val app_name: String,
+    val content_title: String = "",
+    val extracted_text: String
+)
+
+data class ThreatEvaluateResponseDto(
+    val threat_detected: Boolean,
+    val threat_category: String,
+    val confidence_score: Float,
+    val ai_analysis_summary: String,
+    val model_used: String
+)
 
 data class SyncRequest(
     val child_id: String,
@@ -33,6 +96,7 @@ data class SyncResponse(
 data class HealthResponse(
     val status: String,
     val service: String,
+    val deepseek_configured: Boolean = false,
     val timestamp: Long
 )
 
@@ -40,6 +104,21 @@ interface FocusSenseApiService {
 
     @GET("/api/health")
     suspend fun healthCheck(): Response<HealthResponse>
+
+    @POST("/api/auth/register")
+    suspend fun registerParent(@Body payload: RegisterParentDto): Response<AuthResponseDto>
+
+    @POST("/api/auth/login")
+    suspend fun loginParent(@Body payload: LoginParentDto): Response<AuthResponseDto>
+
+    @POST("/api/devices/pair")
+    suspend fun pairChildDevice(@Body payload: PairChildDto): Response<PairChildResponseDto>
+
+    @GET("/api/family/{group_id}/children")
+    suspend fun getFamilyChildren(@Path("group_id") groupId: String): Response<List<UserDto>>
+
+    @POST("/api/ai/evaluate")
+    suspend fun evaluateThreat(@Body payload: ThreatEvaluateRequestDto): Response<ThreatEvaluateResponseDto>
 
     @POST("/api/sync")
     suspend fun syncData(@Body payload: SyncRequest): Response<SyncResponse>
@@ -70,11 +149,15 @@ interface FocusSenseApiService {
 }
 
 object ApiClient {
-    private var currentBaseUrl: String = "https://focussense-api.example.com" // Or http://10.0.2.2:8000 for local
+    private var currentBaseUrl: String = "https://focussense-api.onrender.com"
 
     private val logging = HttpLoggingInterceptor().apply {
         level = HttpLoggingInterceptor.Level.BODY
     }
+
+    private val moshi = Moshi.Builder()
+        .add(KotlinJsonAdapterFactory())
+        .build()
 
     private val okHttpClient = OkHttpClient.Builder()
         .addInterceptor(logging)
@@ -87,7 +170,7 @@ object ApiClient {
         return Retrofit.Builder()
             .baseUrl(formattedUrl)
             .client(okHttpClient)
-            .addConverterFactory(MoshiConverterFactory.create())
+            .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
             .create(FocusSenseApiService::class.java)
     }

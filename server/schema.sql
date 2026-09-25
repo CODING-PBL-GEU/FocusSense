@@ -1,5 +1,8 @@
--- FocusSense PostgreSQL / Supabase Database Schema
--- Run this directly in the Supabase SQL Editor (https://supabase.com/dashboard/project/_/sql)
+-- ==============================================================================
+-- FocusSense PostgreSQL / Supabase Complete Database Schema
+-- Run this directly in your Supabase SQL Editor:
+-- https://supabase.com/dashboard/project/_/sql
+-- ==============================================================================
 
 -- 1. Family Groups Table
 CREATE TABLE IF NOT EXISTS family_groups (
@@ -40,7 +43,7 @@ CREATE TABLE IF NOT EXISTS activity_logs (
     content_title TEXT,
     extracted_text TEXT NOT NULL,
     is_flagged BOOLEAN DEFAULT false,
-    threat_category VARCHAR(64), -- 'Stranger Risk', 'Cyberbullying', 'Academic Distraction', etc.
+    threat_category VARCHAR(64), -- 'Stranger Risk', 'Cyberbullying', 'Academic Distraction', 'Self-Harm', etc.
     confidence_score REAL DEFAULT 0.0,
     ai_analysis_summary TEXT,
     recorded_at BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT,
@@ -73,9 +76,13 @@ CREATE TABLE IF NOT EXISTS location_history (
     is_synced BOOLEAN DEFAULT true
 );
 
--- Performance Indexes
+-- ==============================================================================
+-- High-Performance Indexes for Fast Querying
+-- ==============================================================================
 CREATE INDEX IF NOT EXISTS idx_activity_logs_child ON activity_logs(child_id, recorded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_logs_flagged ON activity_logs(child_id, is_flagged);
 CREATE INDEX IF NOT EXISTS idx_schedule_rules_child ON schedule_rules(child_id);
 CREATE INDEX IF NOT EXISTS idx_location_child ON location_history(child_id, recorded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_id);

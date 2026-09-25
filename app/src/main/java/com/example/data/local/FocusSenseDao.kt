@@ -20,6 +20,12 @@ interface FamilyGroupDao {
 
     @Query("SELECT * FROM family_groups LIMIT 1")
     fun getFamilyGroup(): Flow<FamilyGroupEntity?>
+
+    @Query("SELECT * FROM family_groups WHERE groupId = :groupId LIMIT 1")
+    suspend fun getGroupById(groupId: String): FamilyGroupEntity?
+
+    @Query("DELETE FROM family_groups")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -39,8 +45,17 @@ interface UserDao {
     @Query("SELECT * FROM users WHERE userId = :id LIMIT 1")
     fun getUserById(id: String): Flow<UserEntity?>
 
+    @Query("SELECT * FROM users WHERE userId = :id LIMIT 1")
+    suspend fun getUserByIdSync(id: String): UserEntity?
+
+    @Query("SELECT * FROM users WHERE email = :email LIMIT 1")
+    suspend fun getUserByEmail(email: String): UserEntity?
+
     @Query("UPDATE users SET pin = :pin WHERE userId = :userId")
     suspend fun updatePin(userId: String, pin: String)
+
+    @Query("DELETE FROM users")
+    suspend fun deleteAllUsers()
 }
 
 @Dao
@@ -56,6 +71,9 @@ interface DeviceDao {
 
     @Query("SELECT * FROM devices")
     fun getAllDevices(): Flow<List<DeviceEntity>>
+
+    @Query("DELETE FROM devices")
+    suspend fun deleteAllDevices()
 }
 
 @Dao

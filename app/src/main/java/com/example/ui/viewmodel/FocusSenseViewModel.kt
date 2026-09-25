@@ -96,6 +96,79 @@ class FocusSenseViewModel(
     private val _activeRestrictionOverlay = MutableStateFlow<ActiveAppBlockInfo?>(null)
     val activeRestrictionOverlay: StateFlow<ActiveAppBlockInfo?> = _activeRestrictionOverlay.asStateFlow()
 
+    // Auth & Onboarding State
+    private val _isAuthLoading = MutableStateFlow(false)
+    val isAuthLoading: StateFlow<Boolean> = _isAuthLoading.asStateFlow()
+
+    private val _authError = MutableStateFlow<String?>(null)
+    val authError: StateFlow<String?> = _authError.asStateFlow()
+
+    fun clearAuthError() {
+        _authError.value = null
+    }
+
+    fun signUpParent(
+        name: String,
+        familyName: String,
+        email: String,
+        password: String,
+        pin: String,
+        onSuccess: () -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            _isAuthLoading.value = true
+            _authError.value = null
+            val result = repository.signUpParent(name, familyName, email, password, pin)
+            _isAuthLoading.value = false
+            result.fold(
+                onSuccess = { onSuccess() },
+                onFailure = { _authError.value = it.message ?: "Sign up failed. Please try again." }
+            )
+        }
+    }
+
+    fun signInParent(
+        email: String,
+        password: String,
+        onSuccess: () -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            _isAuthLoading.value = true
+            _authError.value = null
+            val result = repository.signInParent(email, password)
+            _isAuthLoading.value = false
+            result.fold(
+                onSuccess = { onSuccess() },
+                onFailure = { _authError.value = it.message ?: "Sign in failed. Please try again." }
+            )
+        }
+    }
+
+    fun pairChildDevice(
+        parentEmail: String,
+        parentPassword: String,
+        childName: String,
+        deviceName: String,
+        onSuccess: () -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            _isAuthLoading.value = true
+            _authError.value = null
+            val result = repository.pairChildDevice(parentEmail, parentPassword, childName, deviceName)
+            _isAuthLoading.value = false
+            result.fold(
+                onSuccess = { onSuccess() },
+                onFailure = { _authError.value = it.message ?: "Pairing failed. Please check parent credentials." }
+            )
+        }
+    }
+
+    fun signOut() {
+        viewModelScope.launch {
+            repository.signOut()
+        }
+    }
+
     fun switchUser(user: UserEntity) {
         repository.switchUser(user)
         if (user.role == "child") {

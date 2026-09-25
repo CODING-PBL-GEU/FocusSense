@@ -38,7 +38,7 @@ class ThreatEvaluationEngine {
         val apiKey = BuildConfig.GEMINI_API_KEY
 
         // If online and API key is configured and not forced offline, use Gemini 3.5 Flash
-        if (!forceOfflineOnly && apiKey.isNotBlank() && apiKey != "MY_GEMINI_API_KEY") {
+        if (!forceOfflineOnly && apiKey.isNotBlank() && apiKey != "MY_GEMINI_API_KEY" && apiKey != "your_api_key_here") {
             try {
                 val cloudResult = evaluateWithGemini(apiKey, appName, contentTitle, extractedText)
                 if (cloudResult != null) {

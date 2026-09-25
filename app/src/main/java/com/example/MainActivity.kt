@@ -58,6 +58,7 @@ import com.example.data.repository.SentinelEvent
 import com.example.ui.components.AppRestrictionOverlay
 import com.example.ui.components.FocusSenseTopBar
 import com.example.ui.dialogs.ParentPinDialog
+import com.example.ui.screens.auth.RoleSelectionAuthScreen
 import com.example.ui.screens.child.ChildDashboardScreen
 import com.example.ui.screens.parent.ParentDashboardScreen
 import com.example.ui.theme.EmeraldSafe
@@ -90,9 +91,17 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun FocusSenseApp(viewModel: FocusSenseViewModel) {
     val currentUser by viewModel.currentUser.collectAsStateWithLifecycle()
+
+    // 1. Initial State: If user is not yet logged in / onboarded, show Role Selection & Auth
+    if (currentUser == null) {
+        RoleSelectionAuthScreen(viewModel = viewModel)
+        return
+    }
+
     val selectedChildId by viewModel.selectedChildId.collectAsStateWithLifecycle()
     val allUsers by viewModel.allUsers.collectAsStateWithLifecycle()
     val childrenUsers by viewModel.childrenUsers.collectAsStateWithLifecycle()
+    val parentUsers by viewModel.parentUsers.collectAsStateWithLifecycle()
     val isNetworkConnected by viewModel.isNetworkConnected.collectAsStateWithLifecycle()
     val isSyncing by viewModel.isSyncing.collectAsStateWithLifecycle()
     val serverUrl by viewModel.serverUrl.collectAsStateWithLifecycle()
@@ -223,8 +232,10 @@ fun FocusSenseApp(viewModel: FocusSenseViewModel) {
 
     // Parent PIN Verification Dialog
     if (showPinDialog) {
+        val parentPin = parentUsers.firstOrNull()?.pin?.takeIf { it.isNotBlank() } ?: "1234"
         ParentPinDialog(
             onDismiss = { showPinDialog = false },
+            expectedPin = parentPin,
             onPinVerified = {
                 showPinDialog = false
                 if (pendingSwitchUser != null) {
@@ -259,7 +270,7 @@ fun FocusSenseApp(viewModel: FocusSenseViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Select Device Profile",
+                            text = "Device & Account Options",
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -268,84 +279,104 @@ fun FocusSenseApp(viewModel: FocusSenseViewModel) {
                         }
                     }
 
-                    Text(
-                        text = "FocusSense runs on both Parent & Child devices. Switch profile to test or assign this device:",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(vertical = 8.dp)
-                    )
+                    if (allUsers.isNotEmpty()) {
+                        Text(
+                            text = "Switch active profile on this device:",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(vertical = 6.dp)
+                        )
 
-                    Spacer(modifier = Modifier.height(8.dp))
+                        Spacer(modifier = Modifier.height(4.dp))
 
-                    allUsers.forEach { user ->
-                        val isCurrent = user.userId == currentUser?.userId
-                        val roleColor = if (user.role == "parent") PurpleAccent else EmeraldSafe
+                        allUsers.forEach { user ->
+                            val isCurrent = user.userId == currentUser?.userId
+                            val roleColor = if (user.role == "parent") PurpleAccent else EmeraldSafe
 
-                        Card(
-                            shape = RoundedCornerShape(14.dp),
-                            colors = CardDefaults.cardColors(
-                                containerColor = if (isCurrent) IndigoPrimary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
-                            ),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp)
-                                .clickable {
-                                    showProfileSwitchDialog = false
-                                    viewModel.switchUser(user)
-                                }
-                                .testTag("profile_item_${user.userId}")
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(14.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
+                            Card(
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isCurrent) IndigoPrimary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp)
+                                    .clickable {
+                                        showProfileSwitchDialog = false
+                                        viewModel.switchUser(user)
+                                    }
+                                    .testTag("profile_item_${user.userId}")
                             ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(36.dp)
-                                            .clip(CircleShape)
-                                            .background(roleColor.copy(alpha = 0.2f)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            imageVector = if (user.role == "parent") Icons.Default.Person else Icons.Default.Face,
-                                            contentDescription = null,
-                                            tint = roleColor,
-                                            modifier = Modifier.size(20.dp)
-                                        )
+                                Row(
+                                    modifier = Modifier.padding(14.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(36.dp)
+                                                .clip(CircleShape)
+                                                .background(roleColor.copy(alpha = 0.2f)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                imageVector = if (user.role == "parent") Icons.Default.Person else Icons.Default.Face,
+                                                contentDescription = null,
+                                                tint = roleColor,
+                                                modifier = Modifier.size(20.dp)
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(12.dp))
+                                        Column {
+                                            Text(
+                                                text = user.name,
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 14.sp
+                                            )
+                                            Text(
+                                                text = "${user.role.uppercase()} • ${user.email}",
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
                                     }
-                                    Spacer(modifier = Modifier.width(12.dp))
-                                    Column {
-                                        Text(
-                                            text = user.name,
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 14.sp
-                                        )
-                                        Text(
-                                            text = "${user.role.uppercase()} • ${user.email}",
-                                            fontSize = 11.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                }
 
-                                if (isCurrent) {
-                                    Surface(
-                                        shape = RoundedCornerShape(8.dp),
-                                        color = IndigoPrimary
-                                    ) {
-                                        Text(
-                                            text = "Active",
-                                            color = Color.White,
-                                            fontSize = 10.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                        )
+                                    if (isCurrent) {
+                                        Surface(
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = IndigoPrimary
+                                        ) {
+                                            Text(
+                                                text = "Active",
+                                                color = Color.White,
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Sign Out Button
+                    androidx.compose.material3.OutlinedButton(
+                        onClick = {
+                            showProfileSwitchDialog = false
+                            viewModel.signOut()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("auth_signout_button"),
+                        colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error
+                        )
+                    ) {
+                        Text("Sign Out / Switch Device Role", fontWeight = FontWeight.SemiBold)
                     }
                 }
             }

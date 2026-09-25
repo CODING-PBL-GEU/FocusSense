@@ -49,10 +49,11 @@ class FocusSenseRepository(context: Context) {
     private val scope = CoroutineScope(Dispatchers.IO)
 
     // Current Session State
+    private val prefs = context.getSharedPreferences("focussense_session_prefs", Context.MODE_PRIVATE)
     private val _currentUser = MutableStateFlow<UserEntity?>(null)
     val currentUser: StateFlow<UserEntity?> = _currentUser.asStateFlow()
 
-    private val _selectedChildId = MutableStateFlow<String>("child-leo")
+    private val _selectedChildId = MutableStateFlow<String>("")
     val selectedChildId: StateFlow<String> = _selectedChildId.asStateFlow()
 
     // Network & Zero Data-Loss Sync State
@@ -89,14 +90,167 @@ class FocusSenseRepository(context: Context) {
     }
 
     init {
-        // Default session initialization: load default parent or first user
-        scope.launch {
-            db.userDao().getUserById("parent-sarah").collect { parent ->
-                if (parent != null && _currentUser.value == null) {
-                    _currentUser.value = parent
+        // Restore active user session from local preferences
+        val savedUserId = prefs.getString("saved_user_id", null)
+        if (!savedUserId.isNullOrBlank()) {
+            scope.launch {
+                val user = db.userDao().getUserByIdSync(savedUserId)
+                if (user != null) {
+                    _currentUser.value = user
+                    if (user.role == "child") {
+                        _selectedChildId.value = user.userId
+                    }
                 }
             }
         }
+    }
+
+    // Role & User Authentication Methods
+    suspend fun signUpParent(
+        name: String,
+        familyName: String,
+        email: String,
+        password: String,
+        pin: String
+    ): Result<UserEntity> = withContext(Dispatchers.IO) {
+        try {
+            val normalizedEmail = email.trim().lowercase()
+            val existing = db.userDao().getUserByEmail(normalizedEmail)
+            if (existing != null) {
+                return@withContext Result.failure(Exception("An account with email '$normalizedEmail' already exists. Please sign in."))
+            }
+
+            val group = FamilyGroupEntity(
+                groupId = "group-${UUID.randomUUID().toString().take(8)}",
+                familyName = if (familyName.isNotBlank()) familyName.trim() else "${name.trim()}'s Family"
+            )
+            db.familyGroupDao().insert(group)
+
+            val parentUser = UserEntity(
+                userId = "parent-${UUID.randomUUID().toString().take(8)}",
+                groupId = group.groupId,
+                email = normalizedEmail,
+                password = password,
+                role = "parent",
+                name = name.trim(),
+                pin = if (pin.isNotBlank()) pin.trim() else "1234"
+            )
+            db.userDao().insert(parentUser)
+
+            val parentDevice = DeviceEntity(
+                deviceId = "dev-${UUID.randomUUID().toString().take(8)}",
+                userId = parentUser.userId,
+                deviceName = "${name.trim()}'s Parent Phone",
+                batteryPercent = 100,
+                isOnline = true
+            )
+            db.deviceDao().insert(parentDevice)
+
+            // Persist session
+            prefs.edit().putString("saved_user_id", parentUser.userId).apply()
+            _currentUser.value = parentUser
+            Result.success(parentUser)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun signInParent(email: String, password: String): Result<UserEntity> = withContext(Dispatchers.IO) {
+        try {
+            val normalizedEmail = email.trim().lowercase()
+            val user = db.userDao().getUserByEmail(normalizedEmail)
+            if (user == null) {
+                return@withContext Result.failure(Exception("No account found for '$normalizedEmail'. Please create an account first."))
+            }
+            if (user.password != password) {
+                return@withContext Result.failure(Exception("Incorrect password. Please verify and try again."))
+            }
+
+            prefs.edit().putString("saved_user_id", user.userId).apply()
+            _currentUser.value = user
+            if (user.role == "child") {
+                _selectedChildId.value = user.userId
+            }
+            Result.success(user)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun pairChildDevice(
+        parentEmail: String,
+        parentPassword: String,
+        childName: String,
+        deviceName: String
+    ): Result<UserEntity> = withContext(Dispatchers.IO) {
+        try {
+            val normalizedParentEmail = parentEmail.trim().lowercase()
+            var parentUser = db.userDao().getUserByEmail(normalizedParentEmail)
+
+            // If parent not in local DB (e.g. running on separate physical child device),
+            // initialize the parent & family record locally linked with parent's email credentials.
+            val groupId = if (parentUser != null) {
+                if (parentUser.password != parentPassword) {
+                    return@withContext Result.failure(Exception("Parent password incorrect. Cannot link device."))
+                }
+                parentUser.groupId
+            } else {
+                val newGroupId = "group-${UUID.randomUUID().toString().take(8)}"
+                val newGroup = FamilyGroupEntity(
+                    groupId = newGroupId,
+                    familyName = "${childName.trim()}'s Family"
+                )
+                db.familyGroupDao().insert(newGroup)
+
+                val newParent = UserEntity(
+                    userId = "parent-${UUID.randomUUID().toString().take(8)}",
+                    groupId = newGroupId,
+                    email = normalizedParentEmail,
+                    password = parentPassword,
+                    role = "parent",
+                    name = "Parent ($normalizedParentEmail)",
+                    pin = "1234"
+                )
+                db.userDao().insert(newParent)
+                newGroupId
+            }
+
+            val childId = "child-${UUID.randomUUID().toString().take(8)}"
+            val childUser = UserEntity(
+                userId = childId,
+                groupId = groupId,
+                email = "${childName.trim().lowercase().replace(" ", "")}@family.focussense",
+                password = parentPassword,
+                role = "child",
+                name = childName.trim(),
+                pin = ""
+            )
+            db.userDao().insert(childUser)
+
+            val childDevice = DeviceEntity(
+                deviceId = "dev-${UUID.randomUUID().toString().take(8)}",
+                userId = childId,
+                deviceName = if (deviceName.isNotBlank()) deviceName.trim() else "${childName.trim()}'s Device",
+                batteryPercent = 95,
+                isOnline = true
+            )
+            db.deviceDao().insert(childDevice)
+
+            // Persist session as child device
+            prefs.edit().putString("saved_user_id", childId).apply()
+            _currentUser.value = childUser
+            _selectedChildId.value = childId
+
+            Result.success(childUser)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun signOut() = withContext(Dispatchers.IO) {
+        prefs.edit().remove("saved_user_id").apply()
+        _currentUser.value = null
+        _selectedChildId.value = ""
     }
 
     // Role & User Switching

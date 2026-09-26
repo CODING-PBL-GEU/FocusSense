@@ -37,7 +37,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres.jlmyesmofptnrthetvpt:%23SKravi240211964@aws-0-ap-south-1.pooler.supabase.com:5432/postgres"
+    "postgresql://postgres.jlmyesmofptnrthetvpt:%23SKravi240211964@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
 )
 
 # DeepSeek Inference Server URL (e.g. vLLM or Ollama instance)
@@ -56,10 +56,15 @@ elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("p
 # CRITICAL IPv4 COMPATIBILITY FOR RENDER & CLOUD CONTAINERS:
 # Direct Supabase domain 'db.<project>.supabase.co' resolves strictly to IPv6.
 # Render does NOT support outbound IPv6, leading to 'Network is unreachable (2406:da14...)'.
-# Automatically rewrite to Supabase's IPv4 Connection Pooler:
+# Automatically rewrite to Supabase's verified IPv4 Connection Pooler (ap-northeast-1):
 if "db.jlmyesmofptnrthetvpt.supabase.co" in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("db.jlmyesmofptnrthetvpt.supabase.co:5432", "aws-0-ap-south-1.pooler.supabase.com:5432")
+    DATABASE_URL = DATABASE_URL.replace("db.jlmyesmofptnrthetvpt.supabase.co:5432", "aws-0-ap-northeast-1.pooler.supabase.com:5432")
+if "aws-0-ap-south-1.pooler.supabase.com" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("aws-0-ap-south-1.pooler.supabase.com", "aws-0-ap-northeast-1.pooler.supabase.com")
+
+if "postgres:%23SKravi240211964" in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgres:%23SKravi240211964", "postgres.jlmyesmofptnrthetvpt:%23SKravi240211964")
+elif "postgres:#SKravi240211964" in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgres:#SKravi240211964", "postgres.jlmyesmofptnrthetvpt:%23SKravi240211964")
 
 # Supabase strictly requires SSL connections

@@ -37,7 +37,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres:%23SKravi240211964@db.jlmyesmofptnrthetvpt.supabase.co:5432/postgres"
+    "postgresql://postgres.jlmyesmofptnrthetvpt:%23SKravi240211964@aws-0-ap-south-1.pooler.supabase.com:5432/postgres"
 )
 
 # DeepSeek Inference Server URL (e.g. vLLM or Ollama instance)
@@ -52,6 +52,15 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+# CRITICAL IPv4 COMPATIBILITY FOR RENDER & CLOUD CONTAINERS:
+# Direct Supabase domain 'db.<project>.supabase.co' resolves strictly to IPv6.
+# Render does NOT support outbound IPv6, leading to 'Network is unreachable (2406:da14...)'.
+# Automatically rewrite to Supabase's IPv4 Connection Pooler:
+if "db.jlmyesmofptnrthetvpt.supabase.co" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("db.jlmyesmofptnrthetvpt.supabase.co:5432", "aws-0-ap-south-1.pooler.supabase.com:5432")
+    DATABASE_URL = DATABASE_URL.replace("postgres:%23SKravi240211964", "postgres.jlmyesmofptnrthetvpt:%23SKravi240211964")
+    DATABASE_URL = DATABASE_URL.replace("postgres:#SKravi240211964", "postgres.jlmyesmofptnrthetvpt:%23SKravi240211964")
 
 # Supabase strictly requires SSL connections
 if ("supabase.co" in DATABASE_URL or "supabase.com" in DATABASE_URL) and "sslmode" not in DATABASE_URL:
@@ -711,42 +720,46 @@ Respond ONLY in valid JSON matching this schema:
         summary = "Critical distress or self-harm keywords detected. Immediate attention recommended."
 
     if threat_detected:
-        # Ensure child user exists in Supabase to satisfy Foreign Key
-        child_user = db.query(UserModel).filter(UserModel.user_id == payload.child_id).first()
-        if not child_user:
-            group = db.query(FamilyGroupModel).first()
-            if not group:
-                group = FamilyGroupModel(group_id="group-default", family_name="FocusSense Family")
-                db.add(group)
-                db.flush()
-            child_user = UserModel(
-                user_id=payload.child_id,
-                group_id=group.group_id,
-                email=f"{payload.child_id}@family.focussense",
-                password_hash="synced_child",
-                role="child",
-                name="Child Device",
-                pin=""
-            )
-            db.add(child_user)
-            db.commit()
+        try:
+            # Ensure child user exists in Supabase to satisfy Foreign Key
+            child_user = db.query(UserModel).filter(UserModel.user_id == payload.child_id).first()
+            if not child_user:
+                group = db.query(FamilyGroupModel).first()
+                if not group:
+                    group = FamilyGroupModel(group_id="group-default", family_name="FocusSense Family")
+                    db.add(group)
+                    db.flush()
+                child_user = UserModel(
+                    user_id=payload.child_id,
+                    group_id=group.group_id,
+                    email=f"{payload.child_id}@family.focussense",
+                    password_hash="synced_child",
+                    role="child",
+                    name="Child Device",
+                    pin=""
+                )
+                db.add(child_user)
+                db.commit()
 
-        log = ActivityLogModel(
-            log_id=f"log-{uuid.uuid4().hex[:8]}",
-            child_id=payload.child_id,
-            package_name=payload.package_name,
-            app_name=payload.app_name,
-            content_title=payload.content_title,
-            extracted_text=payload.extracted_text,
-            is_flagged=True,
-            threat_category=threat_category,
-            confidence_score=confidence,
-            ai_analysis_summary=summary,
-            recorded_at=int(time.time() * 1000),
-            is_synced=True
-        )
-        db.add(log)
-        db.commit()
+            log = ActivityLogModel(
+                log_id=f"log-{uuid.uuid4().hex[:8]}",
+                child_id=payload.child_id,
+                package_name=payload.package_name,
+                app_name=payload.app_name,
+                content_title=payload.content_title,
+                extracted_text=payload.extracted_text,
+                is_flagged=True,
+                threat_category=threat_category,
+                confidence_score=confidence,
+                ai_analysis_summary=summary,
+                recorded_at=int(time.time() * 1000),
+                is_synced=True
+            )
+            db.add(log)
+            db.commit()
+        except Exception as dbe:
+            db.rollback()
+            print("Database log recording skipped:", str(dbe))
 
     return ThreatEvaluateResponse(
         threat_detected=threat_detected,

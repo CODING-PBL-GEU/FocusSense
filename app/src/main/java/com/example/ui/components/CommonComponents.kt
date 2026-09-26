@@ -287,11 +287,12 @@ fun ThreatCategoryBadge(
     modifier: Modifier = Modifier
 ) {
     val (bg, textCol, label) = when (category) {
+        "Violence & Threats", "Physical Threat", "Violence" -> Triple(CoralDangerBg, CoralDanger, "Physical Violence & Threat")
         "Stranger Risk" -> Triple(CoralDangerBg, CoralDanger, "Stranger Solicitation")
         "Cyberbullying" -> Triple(CoralDangerBg, CoralDanger, "Cyberbullying")
         "Academic Distraction" -> Triple(AmberWarningBg, AmberWarning, "Academic Distraction")
         "Explicit Content" -> Triple(CoralDangerBg, CoralDanger, "Inappropriate Content")
-        "Self-Harm Risk" -> Triple(CoralDangerBg, CoralDanger, "Self-Harm Concern")
+        "Self-Harm Risk", "Self-Harm" -> Triple(CoralDangerBg, CoralDanger, "Self-Harm Concern")
         else -> Triple(EmeraldSafeBg, EmeraldSafe, "Safe Content")
     }
 

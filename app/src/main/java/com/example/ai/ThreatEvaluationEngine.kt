@@ -28,29 +28,91 @@ class ThreatEvaluationEngine {
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    // 1. Primary evaluation method combining Cloud Gemini API with fallback to On-Device MobileBERT
+    // 1. Primary evaluation method combining Render Server (DeepSeek Router) with Cloud Gemini & On-Device Fallback
     suspend fun evaluateContent(
         appName: String,
         contentTitle: String,
         extractedText: String,
+        serverUrl: String = "https://parental-controll.onrender.com",
         forceOfflineOnly: Boolean = false
     ): ThreatAnalysisResult = withContext(Dispatchers.IO) {
-        val apiKey = BuildConfig.GEMINI_API_KEY
+        // Priority 1: Render Central Server (Connecting to DeepSeek / FastAPI safety engine)
+        if (!forceOfflineOnly && serverUrl.isNotBlank()) {
+            try {
+                val serverResult = evaluateWithRenderServer(serverUrl, appName, contentTitle, extractedText)
+                if (serverResult != null) {
+                    return@withContext serverResult
+                }
+            } catch (_: Exception) {
+                // Render server busy/unreachable -> fallback
+            }
+        }
 
-        // If online and API key is configured and not forced offline, use Gemini 3.5 Flash
+        // Priority 2: Gemini Cloud AI (if API key present)
+        val apiKey = BuildConfig.GEMINI_API_KEY
         if (!forceOfflineOnly && apiKey.isNotBlank() && apiKey != "MY_GEMINI_API_KEY" && apiKey != "your_api_key_here") {
             try {
                 val cloudResult = evaluateWithGemini(apiKey, appName, contentTitle, extractedText)
                 if (cloudResult != null) {
                     return@withContext cloudResult
                 }
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 // Fall back gracefully to on-device engine
             }
         }
 
-        // On-Device MobileBERT Classifier (Runs fully offline without network)
+        // Priority 3: On-Device MobileBERT Classifier (Runs fully offline without network)
         return@withContext evaluateOnDeviceMobileBert(appName, contentTitle, extractedText)
+    }
+
+    private fun evaluateWithRenderServer(
+        serverUrl: String,
+        appName: String,
+        contentTitle: String,
+        extractedText: String
+    ): ThreatAnalysisResult? {
+        return try {
+            val cleanUrl = if (serverUrl.endsWith("/")) serverUrl else "$serverUrl/"
+            val endpoint = "${cleanUrl}api/ai/evaluate"
+            val jsonPayload = JSONObject().apply {
+                put("child_id", "active_child")
+                put("package_name", "com.scraped.app")
+                put("app_name", appName)
+                put("content_title", contentTitle)
+                put("extracted_text", extractedText)
+            }
+            val requestBody = jsonPayload.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url(endpoint)
+                .post(requestBody)
+                .build()
+            val response = httpClient.newCall(request).execute()
+            if (response.isSuccessful) {
+                val responseBody = response.body?.string() ?: return null
+                val obj = JSONObject(responseBody)
+                val threatDetected = obj.optBoolean("threat_detected", false)
+                val threatCategory = obj.optString("threat_category", "Safe")
+                val confidence = obj.optDouble("confidence_score", 0.0).toFloat()
+                val summary = obj.optString("ai_analysis_summary", "")
+                val modelUsed = obj.optString("model_used", "Render Server")
+                ThreatAnalysisResult(
+                    isFlagged = threatDetected,
+                    threatCategory = threatCategory,
+                    confidenceScore = confidence,
+                    aiAnalysisSummary = summary,
+                    parentActionGuidance = if (threatDetected) {
+                        "Live alert: FocusSense identified suspicious patterns in $appName."
+                    } else {
+                        "Safe browsing."
+                    },
+                    detectionEngine = modelUsed
+                )
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     // 2. On-Device MobileBERT heuristic & semantic intent evaluation
@@ -62,6 +124,13 @@ class ThreatEvaluationEngine {
         val textToEvaluate = "$contentTitle $extractedText".lowercase()
 
         // Threat Dictionary with weighted semantic scoring
+        val violenceTriggers = listOf(
+            "how to threat", "threat someone", "threaten someone", "threaten", "threatening", "threat",
+            "how to kill", "kill someone", "kill", "murder", "assassinate", "stab", "shoot someone", "shoot",
+            "gun", "guns", "knife", "knives", "weapon", "weapons", "bomb", "explosive", "attack someone",
+            "attack", "hurt someone", "harm someone", "beat up", "poison someone", "poison", "strangle",
+            "mass shooting", "school shooting", "death threat", "punch in the face", "how to hurt"
+        )
         val strangerTriggers = listOf(
             "don't tell your mom", "don't tell your parents", "keep it a secret", "meet me alone",
             "meet me at", "skatepark behind", "send me photos", "how old are you",
@@ -87,6 +156,10 @@ class ThreatEvaluationEngine {
             "harm myself", "bleed out"
         )
 
+        var violenceScore = calculateCategoryScore(textToEvaluate, violenceTriggers)
+        if (Pattern.compile("\\b(kill|kills|killing|threat|threats|threaten|threatens|threatening|murder|stab|shoot|gun|knife|bomb|poison)\\b", Pattern.CASE_INSENSITIVE).matcher(textToEvaluate).find()) {
+            violenceScore = maxOf(violenceScore, 0.95f)
+        }
         var strangerScore = calculateCategoryScore(textToEvaluate, strangerTriggers)
         var bullyingScore = calculateCategoryScore(textToEvaluate, bullyingTriggers)
         var academicScore = calculateCategoryScore(textToEvaluate, academicCheatingTriggers)
@@ -95,6 +168,7 @@ class ThreatEvaluationEngine {
 
         // Evaluate highest risk
         val scores = listOf(
+            Triple("Violence & Threats", violenceScore, 0.65f),
             Triple("Stranger Risk", strangerScore, 0.70f),
             Triple("Self-Harm Risk", selfHarmScore, 0.65f),
             Triple("Cyberbullying", bullyingScore, 0.68f),
@@ -110,6 +184,10 @@ class ThreatEvaluationEngine {
             val guidance: String
 
             when (highestThreat.first) {
+                "Violence & Threats" -> {
+                    summary = "On-Device MobileBERT detected search query or conversation involving physical violence, death threats, or weapon harm."
+                    guidance = "Immediate parental review: Discuss safety and peaceful conflict resolution with child; verify no exposure to dangerous items."
+                }
                 "Stranger Risk" -> {
                     summary = "On-Device MobileBERT detected high-risk solicitation of unsupervised meetup or contact exchange with secrecy pressure."
                     guidance = "Immediate parental intervention recommended: Verify contact identity, speak warmly with child, and restrict chat access."

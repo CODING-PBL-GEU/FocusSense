@@ -1,6 +1,7 @@
 package com.example.data.repository
 
 import android.content.Context
+import android.util.Log
 import com.example.ai.ThreatAnalysisResult
 import com.example.ai.ThreatEvaluationEngine
 import com.example.data.local.FocusSenseDatabase
@@ -63,8 +64,10 @@ class FocusSenseRepository(context: Context) {
     private val _isSyncing = MutableStateFlow<Boolean>(false)
     val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
 
-    // Central Server & Database URL
-    private val _serverUrl = MutableStateFlow<String>("https://focussense-api.onrender.com")
+    // Central Server & Database URL (Render + Supabase PostgreSQL)
+    private val _serverUrl = MutableStateFlow<String>(
+        prefs.getString("server_api_url", "https://parental-controll.onrender.com") ?: "https://parental-controll.onrender.com"
+    )
     val serverUrl: StateFlow<String> = _serverUrl.asStateFlow()
 
     // Real-Time Push / Sentinel Event Stream
@@ -72,7 +75,9 @@ class FocusSenseRepository(context: Context) {
     val eventStream: SharedFlow<SentinelEvent> = _eventStream.asSharedFlow()
 
     fun updateServerUrl(url: String) {
-        _serverUrl.value = url.trim()
+        val cleanUrl = url.trim()
+        _serverUrl.value = cleanUrl
+        prefs.edit().putString("server_api_url", cleanUrl).apply()
     }
 
     suspend fun testServerConnection(): Pair<Boolean, String> = withContext(Dispatchers.IO) {
@@ -80,7 +85,13 @@ class FocusSenseRepository(context: Context) {
             val service = com.example.data.remote.ApiClient.getService(_serverUrl.value)
             val response = service.healthCheck()
             if (response.isSuccessful && response.body() != null) {
-                Pair(true, "Connected to ${response.body()?.service ?: "FocusSense Server"}")
+                val body = response.body()!!
+                val dbStatus = body.database ?: "connected"
+                val counts = body.supabase_counts
+                val countsSummary = if (counts != null && counts.isNotEmpty()) {
+                    " (Users: ${counts["users"] ?: 0}, Logs: ${counts["activity_logs"] ?: 0}, Locations: ${counts["location_points"] ?: 0})"
+                } else ""
+                Pair(true, "Connected: ${body.service} • DB: $dbStatus$countsSummary")
             } else {
                 Pair(false, "Server responded with HTTP ${response.code()}")
             }
@@ -456,6 +467,7 @@ class FocusSenseRepository(context: Context) {
             appName = appName,
             contentTitle = contentTitle,
             extractedText = extractedText,
+            serverUrl = _serverUrl.value,
             forceOfflineOnly = forceOffline || !_isNetworkConnected.value
         )
 
@@ -480,6 +492,22 @@ class FocusSenseRepository(context: Context) {
 
         if (analysis.isFlagged) {
             _eventStream.tryEmit(SentinelEvent.ContentFlagged(log, analysis))
+        }
+
+        // Live Real-Time Server Sync: push directly to Supabase if connected
+        if (_isNetworkConnected.value) {
+            try {
+                val api = com.example.data.remote.ApiClient.getService(_serverUrl.value)
+                api.syncData(
+                    com.example.data.remote.SyncRequest(
+                        child_id = childId.ifBlank { "child-default" },
+                        logs = listOf(log),
+                        locations = emptyList()
+                    )
+                )
+            } catch (e: Exception) {
+                // Stored locally in SQLite, will sync on next cycle
+            }
         }
 
         log
@@ -555,21 +583,55 @@ class FocusSenseRepository(context: Context) {
         )
         db.locationDao().insert(point)
         _eventStream.tryEmit(SentinelEvent.LocationUpdated(locationName, lat, lng))
+
+        if (_isNetworkConnected.value) {
+            try {
+                val api = com.example.data.remote.ApiClient.getService(_serverUrl.value)
+                api.reportLocation(point)
+            } catch (_: Exception) {}
+        }
     }
 
     // 4. Zero Data-Loss Guarantee: Sync queued offline data to Central Python REST / Supabase PostgreSQL
     suspend fun syncOfflineQueue(): Int = withContext(Dispatchers.IO) {
         _isSyncing.value = true
-        // Simulate network roundtrip latency to REST API
-        delay(900)
+        var totalSynced = 0
+        try {
+            val childId = _selectedChildId.value.ifBlank {
+                _currentUser.value?.userId ?: "child-default"
+            }
+            val unsyncedLogs = db.activityLogDao().getUnsyncedLogs()
+            val unsyncedLocations = db.locationDao().getUnsyncedLocations()
 
-        // Mark local records as synced
-        db.activityLogDao().markAllSynced()
-        db.locationDao().markAllSynced()
+            // If no pending unsynced records, sync recent logs and locations to guarantee Supabase has all data
+            val logsToSync = if (unsyncedLogs.isNotEmpty()) unsyncedLogs else db.activityLogDao().getAllLogsSync().take(30)
+            val locationsToSync = if (unsyncedLocations.isNotEmpty()) unsyncedLocations else db.locationDao().getAllLocationsSync().take(30)
 
-        _isSyncing.value = false
-        _eventStream.tryEmit(SentinelEvent.SyncCompleted(1))
-        1
+            if (logsToSync.isNotEmpty() || locationsToSync.isNotEmpty()) {
+                val api = com.example.data.remote.ApiClient.getService(_serverUrl.value)
+                val response = api.syncData(
+                    com.example.data.remote.SyncRequest(
+                        child_id = childId,
+                        logs = logsToSync,
+                        locations = locationsToSync
+                    )
+                )
+                if (response.isSuccessful) {
+                    db.activityLogDao().markAllSynced()
+                    db.locationDao().markAllSynced()
+                    totalSynced = logsToSync.size + locationsToSync.size
+                    Log.i("FocusSenseRepo", "Successfully synced $totalSynced records to Supabase.")
+                } else {
+                    Log.e("FocusSenseRepo", "Server sync returned HTTP ${response.code()}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("FocusSenseRepo", "Sync to server failed: ${e.message}")
+        } finally {
+            _isSyncing.value = false
+            _eventStream.tryEmit(SentinelEvent.SyncCompleted(totalSynced))
+        }
+        totalSynced
     }
 
     // 5. Parent Administrative Actions

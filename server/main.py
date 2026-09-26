@@ -4,6 +4,7 @@ Technology Stack: Python 3.10+, FastAPI (Async), PostgreSQL / Supabase, DeepSeek
 """
 
 import os
+import re
 import time
 import uuid
 import json
@@ -51,6 +52,11 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+# Supabase strictly requires SSL connections
+if ("supabase.co" in DATABASE_URL or "supabase.com" in DATABASE_URL) and "sslmode" not in DATABASE_URL:
+    separator = "&" if "?" in DATABASE_URL else "?"
+    DATABASE_URL = f"{DATABASE_URL}{separator}sslmode=require"
 
 engine = create_engine(
     DATABASE_URL,
@@ -266,14 +272,62 @@ def get_db():
 # Health & Status
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
-def health_check():
+def health_check(db: Session = Depends(get_db)):
+    db_status = "connected"
+    counts = {}
+    try:
+        from sqlalchemy import text
+        db.execute(text("SELECT 1"))
+        # Auto-create tables in Supabase if not already present
+        try:
+            Base.metadata.create_all(bind=engine)
+        except Exception:
+            pass
+        counts = {
+            "users": db.query(UserModel).count(),
+            "activity_logs": db.query(ActivityLogModel).count(),
+            "devices": db.query(DeviceModel).count(),
+            "schedule_rules": db.query(ScheduleRuleModel).count(),
+            "location_points": db.query(LocationPointModel).count()
+        }
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+
     return {
-        "status": "healthy",
+        "status": "healthy" if "error" not in db_status else "database_connection_issue",
         "service": "FocusSense Central Engine",
         "deepseek_configured": bool(DEEPSEEK_SERVER_URL),
-        "database": "Supabase PostgreSQL connected",
+        "database": db_status,
+        "supabase_counts": counts,
         "timestamp": int(time.time() * 1000)
     }
+
+@app.get("/api/admin/init-db")
+def initialize_database(db: Session = Depends(get_db)):
+    """Explicit endpoint to create all tables in Supabase PostgreSQL and return table list."""
+    try:
+        from sqlalchemy import text
+        Base.metadata.create_all(bind=engine)
+        tables = db.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")).fetchall()
+        return {
+            "status": "success",
+            "message": "All tables created successfully in Supabase PostgreSQL!",
+            "tables": [t[0] for t in tables],
+            "counts": {
+                "users": db.query(UserModel).count(),
+                "activity_logs": db.query(ActivityLogModel).count(),
+                "devices": db.query(DeviceModel).count(),
+                "schedule_rules": db.query(ScheduleRuleModel).count(),
+                "location_points": db.query(LocationPointModel).count()
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_type": type(e).__name__,
+            "message": str(e),
+            "hint": "Ensure DATABASE_URL has sslmode=require and credentials are valid."
+        }
 
 # ---------------------------------------------------------------------------
 # 1. Authentication & Device Pairing
@@ -538,11 +592,12 @@ Analyze if this contains:
 3. Explicit or Age-Inappropriate material
 4. Self-Harm or Depression indicators
 5. Academic Cheating / Plagiarism bypassing
+6. Physical Violence, Threats, Weapons, or Harm to Others (e.g. searching how to threat someone, kill, weapons, physical attacks, bomb, poison)
 
 Respond ONLY in valid JSON matching this schema:
 {{
   "threat_detected": boolean,
-  "threat_category": "Stranger Risk" | "Cyberbullying" | "Explicit Content" | "Self-Harm" | "Academic Distraction" | "Safe",
+  "threat_category": "Violence & Threats" | "Stranger Risk" | "Cyberbullying" | "Explicit Content" | "Self-Harm" | "Academic Distraction" | "Safe",
   "confidence_score": float (0.0 to 1.0),
   "ai_analysis_summary": "Short 1-2 sentence explanation for the parent"
 }}"""
@@ -615,7 +670,26 @@ Respond ONLY in valid JSON matching this schema:
     confidence = 0.0
     summary = "No vulnerability detected in this content."
 
-    if any(k in lower_text for k in ["meet up", "alone right now", "don't tell your mom", "dont tell your parents", "secret meeting", "free robux code"]):
+    # 1. Physical Violence, Weapons & Threats to Others
+    violence_words = [
+        "kill", "kills", "killing", "threat", "threats", "threaten", "threatens",
+        "threatening", "murder", "murders", "stab", "stabs", "shoot", "shoots",
+        "shooting", "gun", "guns", "knife", "knives", "bomb", "bombs", "poison"
+    ]
+    violence_phrases = [
+        "how to threat", "threat someone", "threaten someone", "how to kill",
+        "kill someone", "hurt someone", "harm someone", "beat up", "mass shooting",
+        "school shooting", "death threat", "bring a gun", "bring a knife", "punch in the face"
+    ]
+
+    is_violence = any(re.search(r'\b' + re.escape(w) + r'\b', lower_text) for w in violence_words) or any(p in lower_text for p in violence_phrases)
+
+    if is_violence:
+        threat_detected = True
+        threat_category = "Violence & Threats"
+        confidence = 0.96
+        summary = "Search query or message involving physical violence, death threat, weapons, or harm to others detected."
+    elif any(k in lower_text for k in ["meet up", "alone right now", "don't tell your mom", "dont tell your parents", "secret meeting", "free robux code"]):
         threat_detected = True
         threat_category = "Stranger Risk"
         confidence = 0.95
@@ -637,6 +711,26 @@ Respond ONLY in valid JSON matching this schema:
         summary = "Critical distress or self-harm keywords detected. Immediate attention recommended."
 
     if threat_detected:
+        # Ensure child user exists in Supabase to satisfy Foreign Key
+        child_user = db.query(UserModel).filter(UserModel.user_id == payload.child_id).first()
+        if not child_user:
+            group = db.query(FamilyGroupModel).first()
+            if not group:
+                group = FamilyGroupModel(group_id="group-default", family_name="FocusSense Family")
+                db.add(group)
+                db.flush()
+            child_user = UserModel(
+                user_id=payload.child_id,
+                group_id=group.group_id,
+                email=f"{payload.child_id}@family.focussense",
+                password_hash="synced_child",
+                role="child",
+                name="Child Device",
+                pin=""
+            )
+            db.add(child_user)
+            db.commit()
+
         log = ActivityLogModel(
             log_id=f"log-{uuid.uuid4().hex[:8]}",
             child_id=payload.child_id,
@@ -670,6 +764,26 @@ def sync_child_data(payload: SyncPayload, db: Session = Depends(get_db)):
     """Receives offline-queued logs and locations from Child devices."""
     saved_logs_count = 0
     flagged_alerts_count = 0
+
+    # Ensure child user exists in Supabase so ForeignKey doesn't fail
+    child_user = db.query(UserModel).filter(UserModel.user_id == payload.child_id).first()
+    if not child_user:
+        group = db.query(FamilyGroupModel).first()
+        if not group:
+            group = FamilyGroupModel(group_id="group-default", family_name="FocusSense Family")
+            db.add(group)
+            db.flush()
+        child_user = UserModel(
+            user_id=payload.child_id,
+            group_id=group.group_id,
+            email=f"{payload.child_id}@family.focussense",
+            password_hash="synced_child",
+            role="child",
+            name="Child Device",
+            pin=""
+        )
+        db.add(child_user)
+        db.commit()
 
     for log_data in payload.logs:
         existing = db.query(ActivityLogModel).filter(ActivityLogModel.log_id == log_data.log_id).first()

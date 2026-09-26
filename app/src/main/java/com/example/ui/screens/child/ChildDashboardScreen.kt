@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.FilterAlt
 import androidx.compose.material.icons.filled.HourglassBottom
 import androidx.compose.material.icons.filled.HourglassTop
 import androidx.compose.material.icons.filled.LocationOn
@@ -34,7 +35,11 @@ import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Warning
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.service.FocusSenseAccessibilityService
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -83,6 +88,15 @@ import com.example.ui.theme.IndigoPrimary
 import com.example.ui.theme.Navy800
 import com.example.ui.theme.PurpleAccent
 
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.runtime.DisposableEffect
+import com.example.util.ChildPermissionManager
+import com.example.util.ChildPermissionStatus
+
 @Composable
 fun ChildDashboardScreen(
     currentChild: UserEntity?,
@@ -96,7 +110,29 @@ fun ChildDashboardScreen(
     onRequestParentUnlock: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var selectedTab by remember { mutableIntStateOf(0) }
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    var permissionStatus by remember {
+        mutableStateOf(ChildPermissionManager.checkAllPermissions(context))
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                permissionStatus = ChildPermissionManager.checkAllPermissions(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    // Default to the Permission Wizard (Tab 4) if core permissions are missing
+    var selectedTab by remember {
+        mutableIntStateOf(if (!permissionStatus.allCrucialGranted) 4 else 0)
+    }
 
     Scaffold(
         modifier = modifier.fillMaxWidth(),
@@ -109,57 +145,138 @@ fun ChildDashboardScreen(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
                     icon = { Icon(Icons.Default.Schedule, contentDescription = "My Schedule") },
-                    label = { Text("My Schedule", fontSize = 11.sp) },
+                    label = { Text("Schedule", fontSize = 10.sp) },
                     modifier = Modifier.testTag("child_tab_schedule")
                 )
                 NavigationBarItem(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
                     icon = { Icon(Icons.Default.Psychology, contentDescription = "AI Sentinel") },
-                    label = { Text("AI Sentinel", fontSize = 11.sp) },
+                    label = { Text("Sentinel", fontSize = 10.sp) },
                     modifier = Modifier.testTag("child_tab_sentinel")
                 )
                 NavigationBarItem(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
                     icon = { Icon(Icons.Default.HourglassTop, contentDescription = "Focus Shield") },
-                    label = { Text("Focus Shield", fontSize = 11.sp) },
+                    label = { Text("Shield", fontSize = 10.sp) },
                     modifier = Modifier.testTag("child_tab_shield")
                 )
                 NavigationBarItem(
                     selected = selectedTab == 3,
                     onClick = { selectedTab = 3 },
                     icon = { Icon(Icons.Default.LocationOn, contentDescription = "Safety Beacon") },
-                    label = { Text("Safety Beacon", fontSize = 11.sp) },
+                    label = { Text("Beacon", fontSize = 10.sp) },
                     modifier = Modifier.testTag("child_tab_beacon")
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 4,
+                    onClick = { selectedTab = 4 },
+                    icon = {
+                        Box {
+                            Icon(
+                                Icons.Default.Shield,
+                                contentDescription = "Permissions",
+                                tint = if (permissionStatus.isFullyProtected) EmeraldSafe else CoralDanger
+                            )
+                            if (!permissionStatus.isFullyProtected) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .clip(CircleShape)
+                                        .background(CoralDanger)
+                                        .align(Alignment.TopEnd)
+                                )
+                            }
+                        }
+                    },
+                    label = {
+                        Text(
+                            text = if (permissionStatus.isFullyProtected) "Armed" else "Setup",
+                            fontSize = 10.sp,
+                            fontWeight = if (!permissionStatus.isFullyProtected) FontWeight.Bold else FontWeight.Normal,
+                            color = if (permissionStatus.isFullyProtected) EmeraldSafe else CoralDanger
+                        )
+                    },
+                    modifier = Modifier.testTag("child_tab_permissions")
                 )
             }
         }
     ) { innerPadding ->
-        Box(
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            when (selectedTab) {
-                0 -> ChildScheduleTab(
-                    childName = currentChild?.name ?: "Student",
-                    rules = scheduleRules
-                )
-                1 -> ChildSentinelSandboxTab(
-                    isAnalyzing = isAnalyzing,
-                    lastLog = lastSimulatedLog,
-                    onSimulate = onSimulateContentExtraction,
-                    onDismissLog = onDismissSimulatedLog
-                )
-                2 -> ChildFocusShieldTab(
-                    rules = scheduleRules,
-                    onLaunchRestrictedApp = onSimulateRestrictedLaunch
-                )
-                3 -> ChildSafetyBeaconTab(
-                    childName = currentChild?.name ?: "Student",
-                    latestLocation = latestLocation
-                )
+            // Persistent Top Warning Banner if permissions are missing and user is on another tab
+            if (selectedTab != 4 && !permissionStatus.isFullyProtected) {
+                Surface(
+                    color = if (permissionStatus.allCrucialGranted) AmberWarningBg else CoralDangerBg,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { selectedTab = 4 }
+                        .testTag("child_permission_alert_banner")
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = if (permissionStatus.allCrucialGranted) Icons.Default.Warning else Icons.Default.Security,
+                                contentDescription = null,
+                                tint = if (permissionStatus.allCrucialGranted) AmberWarning else CoralDanger,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Setup Incomplete (${permissionStatus.grantedCount}/${permissionStatus.totalCount} active) - Tap to configure",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (permissionStatus.allCrucialGranted) AmberWarning else CoralDanger
+                            )
+                        }
+                        Icon(
+                            imageVector = Icons.Default.ChevronRight,
+                            contentDescription = null,
+                            tint = if (permissionStatus.allCrucialGranted) AmberWarning else CoralDanger,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            }
+
+            Box(modifier = Modifier.fillMaxSize()) {
+                when (selectedTab) {
+                    0 -> ChildScheduleTab(
+                        childName = currentChild?.name ?: "Student",
+                        rules = scheduleRules
+                    )
+                    1 -> ChildSentinelSandboxTab(
+                        isAnalyzing = isAnalyzing,
+                        lastLog = lastSimulatedLog,
+                        onSimulate = onSimulateContentExtraction,
+                        onDismissLog = onDismissSimulatedLog
+                    )
+                    2 -> ChildFocusShieldTab(
+                        rules = scheduleRules,
+                        onLaunchRestrictedApp = onSimulateRestrictedLaunch
+                    )
+                    3 -> ChildSafetyBeaconTab(
+                        childName = currentChild?.name ?: "Student",
+                        latestLocation = latestLocation
+                    )
+                    4 -> ChildPermissionWizardScreen(
+                        childName = currentChild?.name ?: "Student",
+                        onContinueToDashboard = { selectedTab = 0 }
+                    )
+                }
             }
         }
     }
@@ -405,15 +522,20 @@ private fun ChildSentinelSandboxTab(
     onSimulate: (String, String, String, String) -> Unit,
     onDismissLog: () -> Unit
 ) {
+    val isServiceRunning by FocusSenseAccessibilityService.isServiceRunning.collectAsStateWithLifecycle()
+    val metrics by FocusSenseAccessibilityService.metrics.collectAsStateWithLifecycle()
+    val liveScrapedSample by FocusSenseAccessibilityService.lastScrapedContent.collectAsStateWithLifecycle()
+
     var customText by remember { mutableStateOf("") }
     var customAppName by remember { mutableStateOf("Chrome Browser") }
 
     val presets = listOf(
+        Triple("Google Search", "Violence & Threat search test", "how to threat some one and kill without getting caught"),
+        Triple("Chrome Search", "Harm & Weapon query test", "how to kill someone with poison or knife"),
         Triple("Discord Chat", "Stranger solicitation test", "Hey are you alone? Don't tell your parents, meet me at the skatepark behind school at 6pm"),
-        Triple("Google Search", "Academic cheating test", "how to bypass turnitin write my 6th grade history essay free online bot hack"),
-        Triple("YouTube", "Educational science test", "Photosynthesis and cellular respiration in plant cells Khan Academy high school"),
         Triple("Instagram DM", "Cyberbullying test", "Nobody likes you in 7th grade just disappear and leave our group chat"),
-        Triple("Duolingo", "Language learning test", "Complete daily streak: Spanish vocabulary practice - ¿Dónde está el mercado central?")
+        Triple("YouTube Search", "Academic cheating test", "how to bypass turnitin write my 6th grade history essay free online bot hack"),
+        Triple("Duolingo", "Safe educational test", "Complete daily streak: Spanish vocabulary practice - ¿Dónde está el mercado central?")
     )
 
     LazyColumn(
@@ -426,48 +548,201 @@ private fun ChildSentinelSandboxTab(
         item {
             Column {
                 Text(
-                    text = "On-Device Content Sentinel",
+                    text = "AI Sentinel Scraper & Local Filter",
                     fontSize = 20.sp,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "AccessibilityService extracts contextual text; on-device MobileBERT or Gemini AI classifies vulnerabilities in real-time.",
+                    text = "Tier 1 eliminates system UI noise & keyboards. Tier 2 detects heuristic triggers before cloud AI evaluation.",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
 
-        // Sentinel Active Status Indicator
+        // 1. Accessibility Service Live Status & Metrics Counter
         item {
             Surface(
                 shape = RoundedCornerShape(16.dp),
-                color = EmeraldSafeBg,
+                color = if (isServiceRunning) EmeraldSafeBg else AmberWarningBg,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(10.dp)
-                            .clip(CircleShape)
-                            .background(EmeraldSafe)
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Column {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(CircleShape)
+                                    .background(if (isServiceRunning) EmeraldSafe else AmberWarning)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = if (isServiceRunning) "Sentinel Service: ACTIVE" else "Sentinel Service: DISABLED",
+                                fontWeight = FontWeight.Bold,
+                                color = if (isServiceRunning) EmeraldSafe else AmberWarning,
+                                fontSize = 13.sp
+                            )
+                        }
+                        Surface(
+                            color = (if (isServiceRunning) EmeraldSafe else AmberWarning).copy(alpha = 0.2f),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                text = if (isServiceRunning) "Scraping Live" else "Action Needed",
+                                color = if (isServiceRunning) EmeraldSafe else AmberWarning,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // 4-Column Live Scraper Telemetry Metrics
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(text = "${metrics.totalEventsCount}", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            Text(text = "Events", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(text = "${metrics.noisyWindowsFiltered}", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = AmberWarning)
+                            Text(text = "Noise Filtered", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(text = "${metrics.cleanScrapesProcessed}", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = IndigoPrimary)
+                            Text(text = "Clean Scraped", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(text = "${metrics.escalatedThreatsFound}", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = CoralDanger)
+                            Text(text = "Threats Flagged", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Active Window Live Inspector (Real-time Scraped Sample)
+        item {
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surface
+                ),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Visibility,
+                                contentDescription = null,
+                                tint = IndigoPrimary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Active Window Live Inspector",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                        }
+                        liveScrapedSample?.let { sample ->
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = if (sample.isEscalated) CoralDangerBg else EmeraldSafeBg
+                            ) {
+                                Text(
+                                    text = sample.candidateCategory,
+                                    color = if (sample.isEscalated) CoralDanger else EmeraldSafe,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    if (liveScrapedSample != null) {
+                        val sample = liveScrapedSample!!
                         Text(
-                            text = "Accessibility Sentinel Service: ACTIVE",
-                            fontWeight = FontWeight.Bold,
-                            color = EmeraldSafe,
-                            fontSize = 13.sp
+                            text = "App: ${sample.appName} (${sample.packageName})",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = IndigoPrimary
                         )
-                        Text(
-                            text = "Zero Data-Loss active: logs persist locally in Room SQLite.",
-                            fontSize = 11.sp,
-                            color = Color(0xFF065F46)
-                        )
+
+                        if (sample.extractedUrls.isNotEmpty()) {
+                            Text(
+                                text = "URL: ${sample.extractedUrls.first()}",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Text(
+                                    text = "\"${sample.text}\"",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = "Tier 1: ${sample.rawNodesCount} nodes scanned (${sample.noiseFilteredCount} noise filtered)",
+                                        fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    if (sample.detectedKeywords.isNotEmpty()) {
+                                        Text(
+                                            text = "Matched: ${sample.detectedKeywords.take(2).joinToString()}",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = CoralDanger
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "Waiting for live window events... Open Chrome, YouTube, or Discord on this phone to watch the Tier 1 scraper extract and filter text in real time.",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
                     }
                 }
             }

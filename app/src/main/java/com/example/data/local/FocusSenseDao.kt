@@ -107,6 +107,12 @@ interface ActivityLogDao {
 
     @Query("SELECT COUNT(*) FROM activity_logs WHERE isSynced = 0")
     fun getUnsyncedCount(): Flow<Int>
+
+    @Query("SELECT * FROM activity_logs WHERE isSynced = 0 ORDER BY recordedAt ASC")
+    suspend fun getUnsyncedLogs(): List<ActivityLogEntity>
+
+    @Query("SELECT * FROM activity_logs ORDER BY recordedAt DESC LIMIT 100")
+    suspend fun getAllLogsSync(): List<ActivityLogEntity>
 }
 
 @Dao
@@ -155,4 +161,10 @@ interface LocationDao {
 
     @Query("SELECT COUNT(*) FROM location_history WHERE isSynced = 0")
     fun getUnsyncedCount(): Flow<Int>
+
+    @Query("SELECT * FROM location_history WHERE isSynced = 0 ORDER BY recordedAt ASC")
+    suspend fun getUnsyncedLocations(): List<LocationPointEntity>
+
+    @Query("SELECT * FROM location_history ORDER BY recordedAt DESC LIMIT 50")
+    suspend fun getAllLocationsSync(): List<LocationPointEntity>
 }

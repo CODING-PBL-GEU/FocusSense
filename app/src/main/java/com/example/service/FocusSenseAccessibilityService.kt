@@ -11,6 +11,27 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
+data class ScrapedContentSample(
+    val packageName: String,
+    val appName: String,
+    val title: String,
+    val text: String,
+    val timestamp: Long,
+    val candidateCategory: String = "Safe",
+    val detectedKeywords: List<String> = emptyList(),
+    val rawNodesCount: Int = 0,
+    val noiseFilteredCount: Int = 0,
+    val extractedUrls: List<String> = emptyList(),
+    val isEscalated: Boolean = false
+)
+
+data class ScraperMetrics(
+    val totalEventsCount: Long = 0,
+    val noisyWindowsFiltered: Long = 0,
+    val cleanScrapesProcessed: Long = 0,
+    val escalatedThreatsFound: Long = 0
+)
+
 class FocusSenseAccessibilityService : AccessibilityService() {
 
     private val scope = CoroutineScope(Dispatchers.IO)
@@ -20,22 +41,30 @@ class FocusSenseAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         _isServiceRunning.value = true
-        Log.i(TAG, "FocusSense Accessibility Sentinel Connected.")
+        Log.i(TAG, "FocusSense Accessibility Sentinel Connected with Tier 1/2 Scraper Engine.")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
 
         val pkgName = event.packageName?.toString() ?: return
-        // Ignore system UI and own app
-        if (pkgName == packageName || pkgName.contains("launcher") || pkgName.contains("systemui")) {
+
+        _metrics.value = _metrics.value.copy(
+            totalEventsCount = _metrics.value.totalEventsCount + 1
+        )
+
+        // Tier 1: Ignore keyboards, system bars, launchers, and FocusSense itself
+        if (ScraperFilterEngine.isIgnoredPackage(pkgName, packageName)) {
+            _metrics.value = _metrics.value.copy(
+                noisyWindowsFiltered = _metrics.value.noisyWindowsFiltered + 1
+            )
             return
         }
 
         val app = application as? FocusSenseApplication ?: return
         val currentChildId = app.repository.selectedChildId.value
 
-        // 1. Check if package is restricted by active schedule rule right now
+        // 1. Curfew & Schedule Enforcement Check
         scope.launch {
             val restriction = app.repository.checkAppRestriction(currentChildId, pkgName)
             if (restriction.isBlocked) {
@@ -43,52 +72,105 @@ class FocusSenseAccessibilityService : AccessibilityService() {
             }
         }
 
-        // 2. Real-time contextual text extraction
+        // 2. Debounce rapid scrolling/typing events (1500ms debounce)
         val now = System.currentTimeMillis()
-        if (now - lastAnalyzedTime < 2500) {
-            return // Debounce rapid stream
+        if (now - lastAnalyzedTime < 1500) {
+            return
         }
 
         val rootNode = rootInActiveWindow ?: return
-        val extractedStrings = mutableListOf<String>()
-        traverseNodes(rootNode, extractedStrings)
+        val rawNodes = mutableListOf<NodeTextData>()
+        traverseNodes(rootNode, rawNodes)
 
-        val fullText = extractedStrings.joinToString(" ")
-        if (fullText.length > 15 && fullText != lastExtractedText) {
-            lastExtractedText = fullText
-            lastAnalyzedTime = now
-            val truncatedSample = if (fullText.length > 250) fullText.take(250) + "..." else fullText
+        // Tier 1 & Tier 2: Filter and classify window nodes
+        val filterResult = ScraperFilterEngine.filterAndClassifyWindow(
+            packageName = pkgName,
+            ownPackage = packageName,
+            className = event.className?.toString(),
+            nodes = rawNodes
+        )
 
-            _lastScrapedContent.value = ScrapedContentSample(
-                packageName = pkgName,
-                title = event.className?.toString() ?: "Active Window",
-                text = truncatedSample,
-                timestamp = now
+        if (filterResult.isIgnored) {
+            _metrics.value = _metrics.value.copy(
+                noisyWindowsFiltered = _metrics.value.noisyWindowsFiltered + 1
             )
+            return
+        }
 
-            scope.launch {
-                val appLabel = getAppLabel(pkgName)
-                app.repository.processExtractedContent(
-                    childId = currentChildId,
-                    packageName = pkgName,
-                    appName = appLabel,
-                    contentTitle = "Extracted from $appLabel",
-                    extractedText = fullText
-                )
-            }
+        val appLabel = getAppLabel(pkgName)
+        val fullText = filterResult.cleanText
+
+        // Avoid re-processing identical text continuously
+        if (fullText == lastExtractedText) {
+            return
+        }
+        lastExtractedText = fullText
+        lastAnalyzedTime = now
+
+        val truncatedDisplaySample = if (fullText.length > 250) fullText.take(250) + "..." else fullText
+
+        val sample = ScrapedContentSample(
+            packageName = pkgName,
+            appName = appLabel,
+            title = event.className?.toString() ?: "Active Window",
+            text = truncatedDisplaySample,
+            timestamp = now,
+            candidateCategory = filterResult.candidateCategory,
+            detectedKeywords = filterResult.detectedKeywords,
+            rawNodesCount = filterResult.rawNodesCount,
+            noiseFilteredCount = filterResult.noiseNodesFiltered,
+            extractedUrls = filterResult.extractedUrls,
+            isEscalated = filterResult.needsEscalation
+        )
+
+        _lastScrapedContent.value = sample
+
+        _metrics.value = _metrics.value.copy(
+            cleanScrapesProcessed = _metrics.value.cleanScrapesProcessed + 1,
+            escalatedThreatsFound = _metrics.value.escalatedThreatsFound + if (filterResult.needsEscalation) 1 else 0
+        )
+
+        // Forward to Repository -> Local Room SQLite + Cloud AI evaluation
+        scope.launch {
+            app.repository.processExtractedContent(
+                childId = currentChildId,
+                packageName = pkgName,
+                appName = appLabel,
+                contentTitle = if (filterResult.extractedUrls.isNotEmpty()) {
+                    "Browsing: ${filterResult.extractedUrls.first()}"
+                } else {
+                    "Content from $appLabel"
+                },
+                extractedText = fullText
+            )
         }
     }
 
-    private fun traverseNodes(node: AccessibilityNodeInfo?, output: MutableList<String>) {
+    private fun traverseNodes(node: AccessibilityNodeInfo?, output: MutableList<NodeTextData>) {
         if (node == null) return
 
         val text = node.text?.toString()?.trim()
         val desc = node.contentDescription?.toString()?.trim()
+        val viewId = node.viewIdResourceName
 
-        if (!text.isNullOrBlank() && text.length > 2) {
-            output.add(text)
-        } else if (!desc.isNullOrBlank() && desc.length > 2) {
-            output.add(desc)
+        if (!text.isNullOrBlank() && text.length > 1) {
+            output.add(
+                NodeTextData(
+                    text = text,
+                    viewId = viewId,
+                    isPassword = node.isPassword,
+                    isEditable = node.isEditable
+                )
+            )
+        } else if (!desc.isNullOrBlank() && desc.length > 1) {
+            output.add(
+                NodeTextData(
+                    text = desc,
+                    viewId = viewId,
+                    isPassword = node.isPassword,
+                    isEditable = node.isEditable
+                )
+            )
         }
 
         for (i in 0 until node.childCount) {
@@ -104,12 +186,16 @@ class FocusSenseAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {
             when {
                 pkg.contains("youtube") -> "YouTube"
-                pkg.contains("chrome") -> "Chrome"
+                pkg.contains("chrome") -> "Google Chrome"
+                pkg.contains("firefox") -> "Firefox"
                 pkg.contains("discord") -> "Discord"
                 pkg.contains("instagram") -> "Instagram"
+                pkg.contains("whatsapp") -> "WhatsApp"
+                pkg.contains("snapchat") -> "Snapchat"
+                pkg.contains("telegram") -> "Telegram"
                 pkg.contains("tiktok") || pkg.contains("musically") -> "TikTok"
                 pkg.contains("roblox") -> "Roblox"
-                else -> pkg.substringAfterLast('.')
+                else -> pkg.substringAfterLast('.').replaceFirstChar { it.uppercase() }
             }
         }
     }
@@ -134,12 +220,8 @@ class FocusSenseAccessibilityService : AccessibilityService() {
 
         private val _lastBlockedApp = MutableStateFlow<String?>(null)
         val lastBlockedApp = _lastBlockedApp.asStateFlow()
+
+        private val _metrics = MutableStateFlow(ScraperMetrics())
+        val metrics = _metrics.asStateFlow()
     }
 }
-
-data class ScrapedContentSample(
-    val packageName: String,
-    val title: String,
-    val text: String,
-    val timestamp: Long
-)

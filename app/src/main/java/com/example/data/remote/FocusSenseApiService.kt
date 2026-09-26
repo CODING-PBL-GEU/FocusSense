@@ -97,6 +97,8 @@ data class HealthResponse(
     val status: String,
     val service: String,
     val deepseek_configured: Boolean = false,
+    val database: String? = null,
+    val supabase_counts: Map<String, Int>? = null,
     val timestamp: Long
 )
 
@@ -149,7 +151,7 @@ interface FocusSenseApiService {
 }
 
 object ApiClient {
-    private var currentBaseUrl: String = "https://focussense-api.onrender.com"
+    private var currentBaseUrl: String = "https://parental-controll.onrender.com"
 
     private val logging = HttpLoggingInterceptor().apply {
         level = HttpLoggingInterceptor.Level.BODY

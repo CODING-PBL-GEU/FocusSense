@@ -35,11 +35,16 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Warning
+import com.example.ai.ThreatAnalysisResult
+import com.example.ai.ThreatEvaluationEngine
+import com.example.ui.theme.CoralDanger
+import com.example.ui.theme.CoralDangerBg
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
@@ -1269,6 +1274,11 @@ private fun FamilyAndDevicesTab(
             }
         }
 
+        // Day 5: DeepSeek AI Sentinel & Threat Lab Card
+        item {
+            DeepSeekThreatLabCard(serverUrl = serverUrl)
+        }
+
         // Connected Devices
         item {
             Text(
@@ -1364,6 +1374,250 @@ private fun FamilyAndDevicesTab(
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                }
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// DAY 5: DEEPSEEK AI SENTINEL & LIVE THREAT TEST BENCH
+// -------------------------------------------------------------
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun DeepSeekThreatLabCard(serverUrl: String) {
+    var sampleText by remember { mutableStateOf("don't tell your mom meet me behind school") }
+    var isEvaluating by remember { mutableStateOf(false) }
+    var evaluationResult by remember { mutableStateOf<ThreatAnalysisResult?>(null) }
+    val scope = rememberCoroutineScope()
+    val threatEngine = remember { ThreatEvaluationEngine() }
+
+    val presetSamples = listOf(
+        "Stranger Risk" to "don't tell your mom meet me behind school",
+        "Violence & Weapons" to "how to threat someone and kill",
+        "Self-Harm" to "want to die and cut myself",
+        "Cyberbullying" to "nobody likes you ugly freak go die",
+        "Safe Study" to "working on biology presentation about cells"
+    )
+
+    ElevatedCard(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("deepseek_ai_threat_lab_card")
+    ) {
+        Column(modifier = Modifier.padding(18.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = Color(0xFF6366F1).copy(alpha = 0.15f),
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Default.Security,
+                                contentDescription = null,
+                                tint = Color(0xFF6366F1),
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = "DeepSeek AI Sentinel & Threat Pipeline",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp
+                        )
+                        Text(
+                            text = "Day 5: 7-Category Risk Model & Live Classifier",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Text(
+                text = "Live Interactive Test Bench: Evaluate scraped on-screen text in real-time through your Render Python backend and Supabase persistence pipeline.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                lineHeight = 17.sp
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Text(
+                text = "Quick Presets:",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                presetSamples.forEach { (label, phrase) ->
+                    val isSelected = sampleText == phrase
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (isSelected) Color(0xFF6366F1).copy(alpha = 0.15f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        modifier = Modifier.clickable {
+                            sampleText = phrase
+                        }
+                    ) {
+                        Text(
+                            text = label,
+                            fontSize = 11.sp,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                            color = if (isSelected) Color(0xFF6366F1) else MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            OutlinedTextField(
+                value = sampleText,
+                onValueChange = { sampleText = it },
+                label = { Text("Sample Context to Evaluate", fontSize = 12.sp) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("deepseek_sample_input"),
+                maxLines = 3
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Button(
+                onClick = {
+                    isEvaluating = true
+                    scope.launch {
+                        try {
+                            val res = threatEngine.evaluateContent(
+                                appName = "Test Sentinel Window",
+                                contentTitle = "Simulated Chat",
+                                extractedText = sampleText,
+                                serverUrl = serverUrl
+                            )
+                            evaluationResult = res
+                        } catch (_: Exception) {
+                        } finally {
+                            isEvaluating = false
+                        }
+                    }
+                },
+                enabled = !isEvaluating && sampleText.isNotBlank(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6366F1)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("run_deepseek_evaluation_button")
+            ) {
+                if (isEvaluating) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = Color.White
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Evaluating with DeepSeek AI...", fontSize = 12.sp)
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Run Live AI Threat Evaluation", fontSize = 12.sp)
+                }
+            }
+
+            evaluationResult?.let { res ->
+                Spacer(modifier = Modifier.height(12.dp))
+                val isThreat = res.isFlagged
+                val badgeBg = when {
+                    res.severityLevel == "CRITICAL" -> CoralDangerBg
+                    isThreat -> AmberWarningBg
+                    else -> EmeraldSafeBg
+                }
+                val badgeText = when {
+                    res.severityLevel == "CRITICAL" -> CoralDanger
+                    isThreat -> AmberWarning
+                    else -> EmeraldSafe
+                }
+
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = badgeBg,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = res.threatCategory,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp,
+                                color = badgeText
+                            )
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = badgeText.copy(alpha = 0.2f)
+                            ) {
+                                Text(
+                                    text = "${(res.confidenceScore * 100).toInt()}% Conf • ${res.severityLevel}",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = badgeText,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Text(
+                            text = res.aiAnalysisSummary,
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            lineHeight = 16.sp
+                        )
+
+                        if (res.parentActionGuidance.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Action: ${res.recommendedAction} • ${res.parentActionGuidance}",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = badgeText
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Text(
+                            text = "Engine: ${res.detectionEngine}",
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
         }

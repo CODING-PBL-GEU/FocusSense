@@ -182,8 +182,8 @@ class UserResponse(BaseModel):
     email: str
     role: str
     name: str
-    pin: str
-    avatar: str
+    pin: Optional[str] = "1234"
+    avatar: Optional[str] = "default"
 
 class AuthResponse(BaseModel):
     status: str
@@ -257,6 +257,9 @@ class ThreatEvaluateResponse(BaseModel):
     confidence_score: float
     ai_analysis_summary: str
     model_used: str
+    severity_level: Optional[str] = "LOW"
+    recommended_action: Optional[str] = "LOG_ONLY"
+    parent_action_guidance: Optional[str] = ""
 
 # ---------------------------------------------------------------------------
 # FastAPI App Initialization & CORS
@@ -348,63 +351,76 @@ def initialize_database(db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 @app.post("/api/auth/register", response_model=AuthResponse)
 def register_parent(payload: RegisterParentRequest, db: Session = Depends(get_db)):
-    normalized_email = payload.email.strip().lower()
-    existing = db.query(UserModel).filter(UserModel.email == normalized_email).first()
-    if existing:
+    try:
+        normalized_email = payload.email.strip().lower()
+        existing = db.query(UserModel).filter(UserModel.email == normalized_email).first()
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"An account with email '{normalized_email}' already exists. Please sign in."
+            )
+
+        # 1. Create Family Group
+        group_id = f"group-{uuid.uuid4().hex[:8]}"
+        family_name = payload.family_name.strip() if payload.family_name else f"{payload.name.strip()}'s Family"
+        group = FamilyGroupModel(
+            group_id=group_id,
+            family_name=family_name,
+            created_at=int(time.time() * 1000)
+        )
+        db.add(group)
+        db.flush()
+
+        # 2. Create Parent User
+        user_id = f"parent-{uuid.uuid4().hex[:8]}"
+        parent = UserModel(
+            user_id=user_id,
+            group_id=group_id,
+            email=normalized_email,
+            password_hash=payload.password,
+            role="parent",
+            name=payload.name.strip(),
+            pin=payload.pin.strip() if payload.pin else "1234",
+            avatar="parent_avatar"
+        )
+        db.add(parent)
+        db.flush()
+
+        # 3. Create Default Parent Device
+        device_id = f"dev-{uuid.uuid4().hex[:8]}"
+        dev = DeviceModel(
+            device_id=device_id,
+            user_id=user_id,
+            device_name=f"{payload.name.strip()}'s Parent Phone",
+            is_online=True,
+            battery_percent=100,
+            last_active=int(time.time() * 1000)
+        )
+        db.add(dev)
+        db.commit()
+
+        return AuthResponse(
+            status="success",
+            user=UserResponse(
+                user_id=parent.user_id,
+                group_id=parent.group_id,
+                email=parent.email,
+                role=parent.role,
+                name=parent.name,
+                pin=parent.pin or "1234",
+                avatar=parent.avatar or "default"
+            ),
+            family_name=family_name,
+            children=[]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"An account with email '{normalized_email}' already exists. Please sign in."
+            detail=f"Registration failed: {str(e)}"
         )
-
-    # 1. Create Family Group
-    group_id = f"group-{uuid.uuid4().hex[:8]}"
-    family_name = payload.family_name.strip() if payload.family_name else f"{payload.name.strip()}'s Family"
-    group = FamilyGroupModel(
-        group_id=group_id,
-        family_name=family_name
-    )
-    db.add(group)
-
-    # 2. Create Parent User
-    user_id = f"parent-{uuid.uuid4().hex[:8]}"
-    parent = UserModel(
-        user_id=user_id,
-        group_id=group_id,
-        email=normalized_email,
-        password_hash=payload.password,
-        role="parent",
-        name=payload.name.strip(),
-        pin=payload.pin.strip() if payload.pin else "1234",
-        avatar="parent_avatar"
-    )
-    db.add(parent)
-
-    # 3. Create Default Parent Device
-    device_id = f"dev-{uuid.uuid4().hex[:8]}"
-    dev = DeviceModel(
-        device_id=device_id,
-        user_id=user_id,
-        device_name=f"{payload.name.strip()}'s Parent Phone",
-        is_online=True,
-        battery_percent=100
-    )
-    db.add(dev)
-    db.commit()
-
-    return AuthResponse(
-        status="success",
-        user=UserResponse(
-            user_id=parent.user_id,
-            group_id=parent.group_id,
-            email=parent.email,
-            role=parent.role,
-            name=parent.name,
-            pin=parent.pin,
-            avatar=parent.avatar
-        ),
-        family_name=family_name,
-        children=[]
-    )
 
 @app.post("/api/auth/login", response_model=AuthResponse)
 def login_parent(payload: LoginParentRequest, db: Session = Depends(get_db)):
@@ -580,199 +596,300 @@ def get_family_children(group_id: str, db: Session = Depends(get_db)):
     ]
 
 # ---------------------------------------------------------------------------
-# 3. DeepSeek AI Load Balancer & Vulnerability Evaluation
+# 3. DeepSeek AI Load Balancer & Vulnerability Evaluation (Day 5 Pipeline)
 # ---------------------------------------------------------------------------
+SYSTEM_PROMPT = """You are FocusSense Child Sentinel, an expert AI safety evaluator for parental monitoring.
+Your duty is to detect online harms and threats in text scraped from a child's device.
+Evaluate the given text strictly and objectively across these 7 critical categories:
+
+1. "Predatory Grooming & Stranger Risk": Involves secrecy ("don't tell your mom/parents", "our secret"), isolation, sexual advances, requests for private photos/webcam, asking for home address or school location, or planning clandestine in-person meetings.
+2. "Cyberbullying & Harassment": Hostile attacks, public shaming, encouraging suicide/self-harm, discriminatory slurs, relentless insulting or intimidation.
+3. "Self-Harm & Mental Distress": Suicidal intent, despair, self-mutilation (cutting), expressions of wanting to die or disappear.
+4. "Violence, Weapons & Threats": Involves guns, knives, bombs, shooting, murder, assault, searches on how to harm or threat someone.
+5. "Explicit & Adult Content": Pornography, adult services, unsolicited sexually explicit messages, non-consensual imagery.
+6. "Substance Abuse & Drugs": Sourcing, buying, selling, or consuming illegal narcotics, vape, misuse of medications.
+7. "Academic Dishonesty": Bypassing plagiarism/AI detectors, paying for exam cheat materials.
+8. "Safe": Normal harmless conversation, friendly gaming, school research, family chat.
+
+You MUST respond strictly with valid JSON conforming to:
+{
+  "threat_detected": true/false,
+  "threat_category": "Predatory Grooming & Stranger Risk" | "Cyberbullying & Harassment" | "Self-Harm & Mental Distress" | "Violence, Weapons & Threats" | "Explicit & Adult Content" | "Substance Abuse & Drugs" | "Academic Dishonesty" | "Safe",
+  "confidence_score": 0.0 to 1.0,
+  "severity_level": "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
+  "recommended_action": "LOG_ONLY" | "WARN_CHILD" | "PARENT_ALERT" | "INSTANT_BLOCK",
+  "ai_analysis_summary": "<1-2 clear, objective sentences explaining the risk for the parent>",
+  "parent_action_guidance": "<1 specific, practical recommendation for the parent>"
+}
+Do NOT include markdown formatting outside the JSON block."""
+
+@app.get("/api/ai/config")
+def get_ai_sentinel_config():
+    """Returns AI Sentinel status, model information, and active engine."""
+    has_deepseek = bool(DEEPSEEK_SERVER_URL or DEEPSEEK_API_KEY)
+    active_target = DEEPSEEK_SERVER_URL or ("https://api.deepseek.com/chat/completions" if DEEPSEEK_API_KEY else "FocusSense Multi-Category Rule Engine")
+    return {
+        "status": "ready",
+        "deepseek_configured": has_deepseek,
+        "deepseek_model": DEEPSEEK_MODEL,
+        "active_endpoint": active_target,
+        "fallback_engine": "FocusSense Tier-2 Multi-Category Safety Classifier",
+        "supported_categories": [
+            "Predatory Grooming & Stranger Risk",
+            "Cyberbullying & Harassment",
+            "Self-Harm & Mental Distress",
+            "Violence, Weapons & Threats",
+            "Explicit & Adult Content",
+            "Substance Abuse & Drugs",
+            "Academic Dishonesty"
+        ]
+    }
+
+@app.post("/api/evaluate", response_model=ThreatEvaluateResponse)
 @app.post("/api/ai/evaluate", response_model=ThreatEvaluateResponse)
 async def evaluate_content_threat(payload: ThreatEvaluateRequest, db: Session = Depends(get_db)):
     """
-    Acts as router / load balancer to the dedicated DeepSeek AI inference server.
-    If DEEPSEEK_SERVER_URL is configured, calls the self-hosted model.
-    Otherwise, applies instant high-accuracy classification rules.
+    Day 5 DeepSeek AI Threat Pipeline:
+    Routes incoming text from child devices to DeepSeek (vLLM / Ollama / Cloud API)
+    with automatic failover to the multi-category safety rule engine.
+    Persists flagged alerts into Supabase with guaranteed foreign-key resolution.
     """
     text = payload.extracted_text
     lower_text = text.lower()
 
-    if DEEPSEEK_SERVER_URL:
+    # Determine effective DeepSeek endpoint
+    target_url = DEEPSEEK_SERVER_URL
+    if not target_url and DEEPSEEK_API_KEY:
+        target_url = "https://api.deepseek.com/chat/completions"
+
+    if target_url:
         try:
-            prompt = f"""You are a child safety guardian AI analyzing text scraped from a child's device.
+            user_prompt = f"""Context:
 App: {payload.app_name}
-Title: {payload.content_title}
-Text to evaluate:
+Window Title: {payload.content_title}
+Text extracted from screen:
 \"\"\"{text}\"\"\"
 
-Analyze if this contains:
-1. Stranger Danger / Luring / Secret meeting requests
-2. Cyberbullying / Harassment / Hate speech
-3. Explicit or Age-Inappropriate material
-4. Self-Harm or Depression indicators
-5. Academic Cheating / Plagiarism bypassing
-6. Physical Violence, Threats, Weapons, or Harm to Others (e.g. searching how to threat someone, kill, weapons, physical attacks, bomb, poison)
-
-Respond ONLY in valid JSON matching this schema:
-{{
-  "threat_detected": boolean,
-  "threat_category": "Violence & Threats" | "Stranger Risk" | "Cyberbullying" | "Explicit Content" | "Self-Harm" | "Academic Distraction" | "Safe",
-  "confidence_score": float (0.0 to 1.0),
-  "ai_analysis_summary": "Short 1-2 sentence explanation for the parent"
-}}"""
+Analyze according to the safety guidelines and return pure JSON."""
 
             headers = {"Content-Type": "application/json"}
             if DEEPSEEK_API_KEY:
                 headers["Authorization"] = f"Bearer {DEEPSEEK_API_KEY}"
 
-            req_body = {
-                "model": DEEPSEEK_MODEL,
-                "messages": [
-                    {"role": "system", "content": "You are a specialized parental control AI safety evaluator."},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.1,
-                "max_tokens": 250
-            }
+            # Format body for Ollama vs OpenAI/vLLM/DeepSeek
+            if "/api/chat" in target_url:
+                req_body = {
+                    "model": DEEPSEEK_MODEL,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "stream": False,
+                    "format": "json"
+                }
+            else:
+                req_body = {
+                    "model": DEEPSEEK_MODEL,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 300
+                }
 
             status_code = None
             response_json = None
 
             if httpx is not None:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.post(DEEPSEEK_SERVER_URL, json=req_body, headers=headers)
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    resp = await client.post(target_url, json=req_body, headers=headers)
                     status_code = resp.status_code
                     response_json = resp.json()
             elif requests is not None:
-                resp = requests.post(DEEPSEEK_SERVER_URL, json=req_body, headers=headers, timeout=10.0)
+                resp = requests.post(target_url, json=req_body, headers=headers, timeout=8.0)
                 status_code = resp.status_code
                 response_json = resp.json()
 
             if status_code == 200 and response_json:
-                content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                content = ""
+                if "message" in response_json and "content" in response_json["message"]:
+                    content = response_json["message"]["content"]
+                elif "choices" in response_json and len(response_json["choices"]) > 0:
+                    content = response_json["choices"][0].get("message", {}).get("content", "")
+
                 start = content.find("{")
                 end = content.rfind("}")
                 if start != -1 and end != -1:
                     parsed = json.loads(content[start:end+1])
-                    if parsed.get("threat_detected"):
-                        log = ActivityLogModel(
-                            log_id=f"log-{uuid.uuid4().hex[:8]}",
-                            child_id=payload.child_id,
-                            package_name=payload.package_name,
-                            app_name=payload.app_name,
-                            content_title=payload.content_title,
-                            extracted_text=payload.extracted_text,
-                            is_flagged=True,
-                            threat_category=parsed.get("threat_category", "Vulnerability Detected"),
-                            confidence_score=float(parsed.get("confidence_score", 0.9)),
-                            ai_analysis_summary=parsed.get("ai_analysis_summary", ""),
-                            recorded_at=int(time.time() * 1000),
-                            is_synced=True
-                        )
-                        db.add(log)
-                        db.commit()
+                    threat_det = parsed.get("threat_detected", False)
+                    threat_cat = parsed.get("threat_category", "Safe")
+                    conf = float(parsed.get("confidence_score", 0.9))
+                    summary = parsed.get("ai_analysis_summary", "Evaluation complete.")
+                    sev = parsed.get("severity_level", "HIGH" if threat_det else "LOW")
+                    rec_action = parsed.get("recommended_action", "PARENT_ALERT" if threat_det else "LOG_ONLY")
+                    guidance = parsed.get("parent_action_guidance", "Review activity log with child.")
+
+                    if threat_det:
+                        _record_threat_log(db, payload, threat_cat, conf, summary)
 
                     return ThreatEvaluateResponse(
-                        threat_detected=parsed.get("threat_detected", False),
-                        threat_category=parsed.get("threat_category", "Safe"),
-                        confidence_score=float(parsed.get("confidence_score", 0.0)),
-                        ai_analysis_summary=parsed.get("ai_analysis_summary", "Evaluation complete."),
-                        model_used="DeepSeek (Dedicated Server)"
+                        threat_detected=threat_det,
+                        threat_category=threat_cat,
+                        confidence_score=conf,
+                        ai_analysis_summary=summary,
+                        model_used=f"DeepSeek ({DEEPSEEK_MODEL})",
+                        severity_level=sev,
+                        recommended_action=rec_action,
+                        parent_action_guidance=guidance
                     )
         except Exception as e:
-            # Graceful fallback to rule engine if DeepSeek inference server is busy/unreachable
-            pass
+            # Fall through seamlessly to high-precision rule engine
+            print("DeepSeek inference unreachable, activating fallback engine:", str(e))
 
-    # Built-in High-Accuracy Rule Engine (Fallback & Instant Safety Gate)
+    # High-Precision Multi-Category Rule Engine (Fallback & Instant Safety Gate)
     threat_detected = False
     threat_category = "Safe"
     confidence = 0.0
-    summary = "No vulnerability detected in this content."
+    severity = "LOW"
+    action = "LOG_ONLY"
+    summary = "No safety risk detected in this content."
+    guidance = "Normal activity."
 
-    # 1. Physical Violence, Weapons & Threats to Others
-    violence_words = [
-        "kill", "kills", "killing", "threat", "threats", "threaten", "threatens",
-        "threatening", "murder", "murders", "stab", "stabs", "shoot", "shoots",
-        "shooting", "gun", "guns", "knife", "knives", "bomb", "bombs", "poison"
-    ]
-    violence_phrases = [
-        "how to threat", "threat someone", "threaten someone", "how to kill",
-        "kill someone", "hurt someone", "harm someone", "beat up", "mass shooting",
-        "school shooting", "death threat", "bring a gun", "bring a knife", "punch in the face"
-    ]
-
-    is_violence = any(re.search(r'\b' + re.escape(w) + r'\b', lower_text) for w in violence_words) or any(p in lower_text for p in violence_phrases)
-
-    if is_violence:
+    # 1. Self-Harm & Mental Distress (CRITICAL)
+    self_harm_phrases = ["suicide", "want to die", "cut myself", "end my life", "kill myself", "hate being alive", "slit my wrists", "better off dead"]
+    if any(k in lower_text for k in self_harm_phrases):
         threat_detected = True
-        threat_category = "Violence & Threats"
-        confidence = 0.96
-        summary = "Search query or message involving physical violence, death threat, weapons, or harm to others detected."
-    elif any(k in lower_text for k in ["meet up", "alone right now", "don't tell your mom", "dont tell your parents", "secret meeting", "free robux code"]):
-        threat_detected = True
-        threat_category = "Stranger Risk"
-        confidence = 0.95
-        summary = "Potential stranger solicitation or suspicious secrecy request detected."
-    elif any(k in lower_text for k in ["kill yourself", "loser", "nobody likes you", "ugly", "freak", "stupid idiot"]):
-        threat_detected = True
-        threat_category = "Cyberbullying"
-        confidence = 0.92
-        summary = "Hostile or harassing language targeted at child detected."
-    elif any(k in lower_text for k in ["bypass turnitin", "write my essay fast bot", "cheat exam questions"]):
-        threat_detected = True
-        threat_category = "Academic Distraction"
-        confidence = 0.88
-        summary = "Attempt to bypass academic integrity tools detected."
-    elif any(k in lower_text for k in ["suicide", "want to die", "cut myself", "end my life"]):
-        threat_detected = True
-        threat_category = "Self-Harm"
+        threat_category = "Self-Harm & Mental Distress"
         confidence = 0.98
-        summary = "Critical distress or self-harm keywords detected. Immediate attention recommended."
+        severity = "CRITICAL"
+        action = "PARENT_ALERT"
+        summary = "Critical distress or self-harm keywords detected in active window."
+        guidance = "Reach out to your child immediately with empathy and seek professional adolescent mental health support if needed."
+
+    # 2. Violence, Weapons & Threats (CRITICAL)
+    elif any(p in lower_text for p in [
+        "how to threat", "threat someone", "threaten someone", "how to kill",
+        "kill someone", "hurt someone", "harm someone", "mass shooting",
+        "school shooting", "death threat", "bring a gun", "bring a knife", "make a bomb"
+    ]) or (any(w in lower_text for w in ["kill", "murder", "shoot", "bomb", "stab"]) and any(w in lower_text for w in ["school", "people", "someone", "gun", "knife"])):
+        threat_detected = True
+        threat_category = "Violence, Weapons & Threats"
+        confidence = 0.96
+        severity = "CRITICAL"
+        action = "INSTANT_BLOCK"
+        summary = "Search query or message involving physical violence, death threats, or weapons detected."
+        guidance = "Intervene and discuss the context of weapon searches or threatening statements immediately."
+
+    # 3. Predatory Grooming & Stranger Risk (HIGH)
+    elif any(k in lower_text for k in [
+        "don't tell your mom", "dont tell your parents", "keep this secret", "secret meeting",
+        "send me pics", "turn on camera", "are you alone", "where do you go to school",
+        "meet behind", "come over to my place", "free robux code click here"
+    ]):
+        threat_detected = True
+        threat_category = "Predatory Grooming & Stranger Risk"
+        confidence = 0.95
+        severity = "HIGH"
+        action = "PARENT_ALERT"
+        summary = "Potential stranger solicitation, clandestine meeting request, or secrecy coercion detected."
+        guidance = "Verify who your child is communicating with and reinforce safety rules about never sharing personal details or photos."
+
+    # 4. Cyberbullying & Harassment (HIGH)
+    elif any(k in lower_text for k in ["kill yourself", "loser", "nobody likes you", "ugly freak", "stupid idiot", "go die", "you are worthless"]):
+        threat_detected = True
+        threat_category = "Cyberbullying & Harassment"
+        confidence = 0.92
+        severity = "HIGH"
+        action = "PARENT_ALERT"
+        summary = "Hostile, degrading, or harassing language targeted at child detected."
+        guidance = "Review the social chat app and offer support against online bullying."
+
+    # 5. Explicit & Adult Content (HIGH)
+    elif any(k in lower_text for k in ["pornhub", "xvideos", "nsfw video", "adult content 18+", "nude pics", "onlyfans leaks"]):
+        threat_detected = True
+        threat_category = "Explicit & Adult Content"
+        confidence = 0.94
+        severity = "HIGH"
+        action = "INSTANT_BLOCK"
+        summary = "Adult or sexually explicit content attempt identified."
+        guidance = "Ensure web filtering and search safe modes are locked on child devices."
+
+    # 6. Substance Abuse & Drugs (MEDIUM)
+    elif any(k in lower_text for k in ["buy weed online", "vape juice puff", "order edibles", "buy pills online", "disposable vape"]):
+        threat_detected = True
+        threat_category = "Substance Abuse & Drugs"
+        confidence = 0.90
+        severity = "MEDIUM"
+        action = "PARENT_ALERT"
+        summary = "References to vaping, narcotics, or unregulated substance sourcing detected."
+        guidance = "Discuss substance abuse risks openly and inspect installed package allowances."
+
+    # 7. Academic Dishonesty (LOW)
+    elif any(k in lower_text for k in ["bypass turnitin", "write my essay fast bot", "cheat exam questions", "steal answers"]):
+        threat_detected = True
+        threat_category = "Academic Dishonesty"
+        confidence = 0.88
+        severity = "LOW"
+        action = "LOG_ONLY"
+        summary = "Attempt to bypass academic integrity tools detected."
+        guidance = "Review study habits and encourage independent learning."
 
     if threat_detected:
-        try:
-            # Ensure child user exists in Supabase to satisfy Foreign Key
-            child_user = db.query(UserModel).filter(UserModel.user_id == payload.child_id).first()
-            if not child_user:
-                group = db.query(FamilyGroupModel).first()
-                if not group:
-                    group = FamilyGroupModel(group_id="group-default", family_name="FocusSense Family")
-                    db.add(group)
-                    db.flush()
-                child_user = UserModel(
-                    user_id=payload.child_id,
-                    group_id=group.group_id,
-                    email=f"{payload.child_id}@family.focussense",
-                    password_hash="synced_child",
-                    role="child",
-                    name="Child Device",
-                    pin=""
-                )
-                db.add(child_user)
-                db.commit()
-
-            log = ActivityLogModel(
-                log_id=f"log-{uuid.uuid4().hex[:8]}",
-                child_id=payload.child_id,
-                package_name=payload.package_name,
-                app_name=payload.app_name,
-                content_title=payload.content_title,
-                extracted_text=payload.extracted_text,
-                is_flagged=True,
-                threat_category=threat_category,
-                confidence_score=confidence,
-                ai_analysis_summary=summary,
-                recorded_at=int(time.time() * 1000),
-                is_synced=True
-            )
-            db.add(log)
-            db.commit()
-        except Exception as dbe:
-            db.rollback()
-            print("Database log recording skipped:", str(dbe))
+        _record_threat_log(db, payload, threat_category, confidence, summary)
 
     return ThreatEvaluateResponse(
         threat_detected=threat_detected,
         threat_category=threat_category,
         confidence_score=confidence,
         ai_analysis_summary=summary,
-        model_used="FocusSense Rule Engine"
+        model_used="FocusSense Tier-2 Multi-Category Safety Classifier",
+        severity_level=severity,
+        recommended_action=action,
+        parent_action_guidance=guidance
     )
+
+def _record_threat_log(db: Session, payload: ThreatEvaluateRequest, category: str, confidence: float, summary: str):
+    """Guarantees resilient recording of flagged incidents into Supabase."""
+    try:
+        child_user = db.query(UserModel).filter(UserModel.user_id == payload.child_id).first()
+        if not child_user:
+            group = db.query(FamilyGroupModel).first()
+            if not group:
+                group = FamilyGroupModel(group_id="group-default", family_name="FocusSense Family")
+                db.add(group)
+                db.flush()
+            child_user = UserModel(
+                user_id=payload.child_id,
+                group_id=group.group_id,
+                email=f"{payload.child_id}@family.focussense",
+                password_hash="synced_child",
+                role="child",
+                name="Child Device",
+                pin=""
+            )
+            db.add(child_user)
+            db.commit()
+
+        log = ActivityLogModel(
+            log_id=f"log-{uuid.uuid4().hex[:8]}",
+            child_id=payload.child_id,
+            package_name=payload.package_name,
+            app_name=payload.app_name,
+            content_title=payload.content_title,
+            extracted_text=payload.extracted_text,
+            is_flagged=True,
+            threat_category=category,
+            confidence_score=confidence,
+            ai_analysis_summary=summary,
+            recorded_at=int(time.time() * 1000),
+            is_synced=True
+        )
+        db.add(log)
+        db.commit()
+    except Exception as dbe:
+        db.rollback()
+        print("Database log recording skipped:", str(dbe))
 
 # ---------------------------------------------------------------------------
 # 4. Activity Logs & Zero Data-Loss Sync (Child -> Server)

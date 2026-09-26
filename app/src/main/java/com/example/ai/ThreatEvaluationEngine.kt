@@ -18,7 +18,9 @@ data class ThreatAnalysisResult(
     val confidenceScore: Float, // 0.0 to 1.0
     val aiAnalysisSummary: String,
     val parentActionGuidance: String,
-    val detectionEngine: String // "On-Device MobileBERT Classifier" or "Gemini 3.5 Flash Cloud AI"
+    val detectionEngine: String, // "DeepSeek (Dedicated Server)", "On-Device MobileBERT Classifier" or "Gemini 3.5 Flash Cloud AI"
+    val severityLevel: String = "LOW",
+    val recommendedAction: String = "LOG_ONLY"
 )
 
 class ThreatEvaluationEngine {
@@ -94,18 +96,23 @@ class ThreatEvaluationEngine {
                 val threatCategory = obj.optString("threat_category", "Safe")
                 val confidence = obj.optDouble("confidence_score", 0.0).toFloat()
                 val summary = obj.optString("ai_analysis_summary", "")
-                val modelUsed = obj.optString("model_used", "Render Server")
+                val modelUsed = obj.optString("model_used", "DeepSeek / FocusSense Server")
+                val severity = obj.optString("severity_level", if (threatDetected) "HIGH" else "LOW")
+                val recommendedAction = obj.optString("recommended_action", if (threatDetected) "PARENT_ALERT" else "LOG_ONLY")
+                val parentGuidance = obj.optString("parent_action_guidance", if (threatDetected) {
+                    "Live alert: FocusSense identified suspicious patterns in $appName."
+                } else {
+                    "Safe browsing."
+                })
                 ThreatAnalysisResult(
                     isFlagged = threatDetected,
                     threatCategory = threatCategory,
                     confidenceScore = confidence,
                     aiAnalysisSummary = summary,
-                    parentActionGuidance = if (threatDetected) {
-                        "Live alert: FocusSense identified suspicious patterns in $appName."
-                    } else {
-                        "Safe browsing."
-                    },
-                    detectionEngine = modelUsed
+                    parentActionGuidance = parentGuidance,
+                    detectionEngine = modelUsed,
+                    severityLevel = severity,
+                    recommendedAction = recommendedAction
                 )
             } else {
                 null

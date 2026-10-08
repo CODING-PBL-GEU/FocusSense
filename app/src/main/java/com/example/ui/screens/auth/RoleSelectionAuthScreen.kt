@@ -100,7 +100,9 @@ enum class SelectedRoleView {
     PARENT_FLOW,
     CHILD_FLOW
 }
-
+private fun isValidProjectName(name: String): Boolean {
+    return name.isNotBlank() && name.length <= 50
+}
 @Composable
 fun RoleSelectionAuthScreen(
     viewModel: FocusSenseViewModel,

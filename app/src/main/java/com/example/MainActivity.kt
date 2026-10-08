@@ -56,33 +56,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.model.UserEntity
 import com.example.data.repository.SentinelEvent
 import com.example.ui.components.AppRestrictionOverlay
-import com.example.ui.components.FocusSenseTopBar
-import com.example.ui.dialogs.ParentPinDialog
-import com.example.ui.screens.auth.RoleSelectionAuthScreen
-import com.example.ui.screens.child.ChildDashboardScreen
-import com.example.ui.screens.parent.ParentDashboardScreen
-import com.example.ui.theme.EmeraldSafe
-import com.example.ui.theme.IndigoPrimary
-import com.example.ui.theme.MyApplicationTheme
-import com.example.ui.theme.PurpleAccent
-import com.example.ui.viewmodel.FocusSenseViewModel
-import com.example.ui.viewmodel.FocusSenseViewModelFactory
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.launch
 
-class MainActivity : ComponentActivity() {
-
-    private val viewModel: FocusSenseViewModel by viewModels {
-        FocusSenseViewModelFactory((application as FocusSenseApplication).repository)
-    }
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
-
-        setContent {
-            MyApplicationTheme {
-                FocusSenseApp(viewModel = viewModel)
             }
         }
     }

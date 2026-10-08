@@ -24,26 +24,12 @@ class FocusSenseApplication : Application() {
 
             // Sentinel Alerts Channel
             val alertChannel = NotificationChannel(
-                CHANNEL_ALERTS,
-                "FocusSense Safety Alerts",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "Urgent notifications regarding flagged vulnerabilities and safety concerns"
-                enableVibration(true)
-            }
-
-            // Location Beacon Foreground Channel
+                CHAN
             val locationChannel = NotificationChannel(
                 CHANNEL_LOCATION,
                 "FocusSense Safety Beacon",
                 NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Background location safety tracker for child oversight"
-            }
-
-            notificationManager.createNotificationChannel(alertChannel)
-            notificationManager.createNotificationChannel(locationChannel)
-        }
+            
     }
 
     companion object {

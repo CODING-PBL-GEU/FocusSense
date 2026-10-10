@@ -102,10 +102,39 @@ data class HealthResponse(
     val timestamp: Long
 )
 
+data class AIConfigResponse(
+    val status: String,
+    val gemini_configured: Boolean = true,
+    val gemini_model: String? = "gemini-3.5-flash",
+    val deepseek_configured: Boolean = false,
+    val deepseek_model: String = "gemini-3.5-flash",
+    val active_endpoint: String = "Gemini 3.5 Flash Cloud AI",
+    val fallback_engine: String? = null,
+    val message: String? = null
+)
+
+data class AIConfigUpdateRequest(
+    val gemini_api_key: String? = null,
+    val deepseek_api_key: String? = null,
+    val deepseek_server_url: String? = null,
+    val deepseek_model: String? = null
+)
+
+data class AppBlockToggleDto(
+    val package_name: String,
+    val is_blocked: Boolean
+)
+
 interface FocusSenseApiService {
 
     @GET("/api/health")
     suspend fun healthCheck(): Response<HealthResponse>
+
+    @GET("/api/ai/config")
+    suspend fun getAIConfig(): Response<AIConfigResponse>
+
+    @POST("/api/ai/config")
+    suspend fun updateAIConfig(@Body payload: AIConfigUpdateRequest): Response<AIConfigResponse>
 
     @POST("/api/auth/register")
     suspend fun registerParent(@Body payload: RegisterParentDto): Response<AuthResponseDto>
@@ -148,6 +177,23 @@ interface FocusSenseApiService {
 
     @GET("/api/location/{child_id}/latest")
     suspend fun getLatestLocation(@Path("child_id") childId: String): Response<LocationPointEntity>
+
+    @POST("/api/devices/{child_id}/apps/sync")
+    suspend fun syncInstalledApps(
+        @Path("child_id") childId: String,
+        @Body apps: List<com.example.data.model.InstalledAppEntity>
+    ): Response<Map<String, Any>>
+
+    @GET("/api/devices/{child_id}/apps")
+    suspend fun getInstalledApps(
+        @Path("child_id") childId: String
+    ): Response<List<com.example.data.model.InstalledAppEntity>>
+
+    @POST("/api/devices/{child_id}/apps/toggle-block")
+    suspend fun toggleAppBlock(
+        @Path("child_id") childId: String,
+        @Body payload: AppBlockToggleDto
+    ): Response<Map<String, Any>>
 }
 
 object ApiClient {

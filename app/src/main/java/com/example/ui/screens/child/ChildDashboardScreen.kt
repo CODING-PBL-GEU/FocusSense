@@ -97,6 +97,15 @@ import androidx.compose.runtime.DisposableEffect
 import com.example.util.ChildPermissionManager
 import com.example.util.ChildPermissionStatus
 
+private fun isValidTimeRange(
+    startMinutes: Int,
+    endMinutes: Int
+): Boolean {
+    return startMinutes in 0..1439 &&
+            endMinutes in 0..1439 &&
+            startMinutes != endMinutes
+}
+
 @Composable
 fun ChildDashboardScreen(
     currentChild: UserEntity?,

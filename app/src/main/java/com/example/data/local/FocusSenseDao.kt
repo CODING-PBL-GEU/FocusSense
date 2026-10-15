@@ -13,14 +13,20 @@ import com.example.data.model.ScheduleRuleEntity
 import com.example.data.model.UserEntity
 import kotlinx.coroutines.flow.Flow
 
+
+
 @Dao
 interface FamilyGroupDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(group: FamilyGroupEntity)
 
+
+    
     @Query("SELECT * FROM family_groups LIMIT 1")
     fun getFamilyGroup(): Flow<FamilyGroupEntity?>
 
+
+    
     @Query("SELECT * FROM family_groups WHERE groupId = :groupId LIMIT 1")
     suspend fun getGroupById(groupId: String): FamilyGroupEntity?
 

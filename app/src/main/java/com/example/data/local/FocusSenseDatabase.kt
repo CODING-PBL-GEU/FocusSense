@@ -11,6 +11,7 @@ import com.example.data.model.LocationPointEntity
 import com.example.data.model.ScheduleRuleEntity
 import com.example.data.model.UserEntity
 
+
 @Database(
     entities = [
         FamilyGroupEntity::class,
@@ -23,6 +24,7 @@ import com.example.data.model.UserEntity
     version = 2,
     exportSchema = false
 )
+
 abstract class FocusSenseDatabase : RoomDatabase() {
 
     abstract fun familyGroupDao(): FamilyGroupDao
@@ -32,6 +34,7 @@ abstract class FocusSenseDatabase : RoomDatabase() {
     abstract fun scheduleRuleDao(): ScheduleRuleDao
     abstract fun locationDao(): LocationDao
 
+    
     companion object {
         @Volatile
         private var INSTANCE: FocusSenseDatabase? = null

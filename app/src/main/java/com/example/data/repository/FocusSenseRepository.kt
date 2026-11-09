@@ -8,25 +8,36 @@ import com.example.data.local.FocusSenseDatabase
 import com.example.data.model.ActivityLogEntity
 import com.example.data.model.DeviceEntity
 import com.example.data.model.FamilyGroupEntity
+import com.example.data.model.InstalledAppEntity
 import com.example.data.model.LocationPointEntity
 import com.example.data.model.ScheduleRuleEntity
 import com.example.data.model.UserEntity
+import com.example.util.InstalledAppScanner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
+import android.content.Intent
+import android.net.Uri
+import com.example.receiver.FocusSenseAdminReceiver
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 sealed class SentinelEvent {
     data class ContentFlagged(val log: ActivityLogEntity, val threatResult: ThreatAnalysisResult) : SentinelEvent()
@@ -45,7 +56,8 @@ data class ActiveAppBlockInfo(
 
 class FocusSenseRepository(context: Context) {
 
-    private val db = FocusSenseDatabase.getInstance(context)
+    private val appContext = context.applicationContext
+    private val db = FocusSenseDatabase.getInstance(appContext)
     private val threatEngine = ThreatEvaluationEngine()
     private val scope = CoroutineScope(Dispatchers.IO)
 
@@ -53,6 +65,9 @@ class FocusSenseRepository(context: Context) {
     private val prefs = context.getSharedPreferences("focussense_session_prefs", Context.MODE_PRIVATE)
     private val _currentUser = MutableStateFlow<UserEntity?>(null)
     val currentUser: StateFlow<UserEntity?> = _currentUser.asStateFlow()
+
+    private val _isSessionReady = MutableStateFlow<Boolean>(false)
+    val isSessionReady: StateFlow<Boolean> = _isSessionReady.asStateFlow()
 
     private val _selectedChildId = MutableStateFlow<String>("")
     val selectedChildId: StateFlow<String> = _selectedChildId.asStateFlow()
@@ -100,19 +115,202 @@ class FocusSenseRepository(context: Context) {
         }
     }
 
+    // In-Memory App Blocking Cache for 0ms Latency in AccessibilityService
+    private val _instantBlockedPackages = MutableStateFlow<Set<String>>(emptySet())
+    val instantBlockedPackages: StateFlow<Set<String>> = _instantBlockedPackages.asStateFlow()
+
+    private val _temporaryUnlockedPackages = ConcurrentHashMap<String, Long>()
+
+    // Pomodoro Child Focus Lock State
+    data class PomodoroState(
+        val packageName: String,
+        val appName: String,
+        val durationMinutes: Int,
+        val remainingSeconds: Long,
+        val isRunning: Boolean
+    )
+
+    private val _pomodoroState = MutableStateFlow<PomodoroState?>(null)
+    val pomodoroState: StateFlow<PomodoroState?> = _pomodoroState.asStateFlow()
+
+    private var pomodoroJob: Job? = null
+
+    fun startPomodoro(packageName: String, appName: String, durationMinutes: Int) {
+        pomodoroJob?.cancel()
+        val totalSecs = (durationMinutes * 60).toLong()
+        _pomodoroState.value = PomodoroState(
+            packageName = packageName.lowercase(),
+            appName = appName,
+            durationMinutes = durationMinutes,
+            remainingSeconds = totalSecs,
+            isRunning = true
+        )
+
+        pomodoroJob = CoroutineScope(Dispatchers.IO).launch {
+            var currentSecs = totalSecs
+            while (currentSecs > 0 && _pomodoroState.value?.isRunning == true) {
+                delay(1000)
+                currentSecs--
+                _pomodoroState.value = _pomodoroState.value?.copy(remainingSeconds = currentSecs)
+            }
+            if (currentSecs <= 0) {
+                _pomodoroState.value = _pomodoroState.value?.copy(remainingSeconds = 0, isRunning = false)
+            }
+        }
+    }
+
+    fun pausePomodoro() {
+        _pomodoroState.value = _pomodoroState.value?.copy(isRunning = false)
+        pomodoroJob?.cancel()
+    }
+
+    fun resumePomodoro() {
+        val current = _pomodoroState.value ?: return
+        if (current.remainingSeconds <= 0) return
+        _pomodoroState.value = current.copy(isRunning = true)
+
+        pomodoroJob?.cancel()
+        pomodoroJob = CoroutineScope(Dispatchers.IO).launch {
+            var currentSecs = current.remainingSeconds
+            while (currentSecs > 0 && _pomodoroState.value?.isRunning == true) {
+                delay(1000)
+                currentSecs--
+                _pomodoroState.value = _pomodoroState.value?.copy(remainingSeconds = currentSecs)
+            }
+            if (currentSecs <= 0) {
+                _pomodoroState.value = _pomodoroState.value?.copy(remainingSeconds = 0, isRunning = false)
+            }
+        }
+    }
+
+    fun stopPomodoro() {
+        pomodoroJob?.cancel()
+        _pomodoroState.value = null
+    }
+
+    fun isPackageBlockedSync(packageName: String): Boolean {
+        val lower = packageName.lowercase()
+        val tempExpiry = _temporaryUnlockedPackages[lower] ?: 0L
+        if (tempExpiry > System.currentTimeMillis()) {
+            return false
+        }
+        return _instantBlockedPackages.value.any { it.equals(lower, ignoreCase = true) }
+    }
+
+    fun temporarilyUnlockApp(packageName: String, minutes: Int = 10) {
+        val lower = packageName.lowercase()
+        _temporaryUnlockedPackages[lower] = System.currentTimeMillis() + (minutes * 60 * 1000L)
+    }
+
+    fun isPackageTemporarilyUnlocked(packageName: String): Boolean {
+        val lower = packageName.lowercase()
+        val tempExpiry = _temporaryUnlockedPackages[lower] ?: 0L
+        return tempExpiry > System.currentTimeMillis()
+    }
+
+    private val _recentLoggedThreats = ConcurrentHashMap<String, Long>()
+    private val _antiTamperDisabledUntil = MutableStateFlow(0L)
+
+    fun isAntiTamperTemporarilyDisabled(): Boolean {
+        return _antiTamperDisabledUntil.value > System.currentTimeMillis()
+    }
+
+    fun disableAntiTamperForUninstall(minutes: Int = 10) {
+        _antiTamperDisabledUntil.value = System.currentTimeMillis() + (minutes * 60 * 1000L)
+    }
+
+    fun deactivateDeviceAdminAndUninstall(context: Context) {
+        try {
+            val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
+            val adminComponent = ComponentName(context, FocusSenseAdminReceiver::class.java)
+            if (dpm != null && dpm.isAdminActive(adminComponent)) {
+                dpm.removeActiveAdmin(adminComponent)
+            }
+            disableAntiTamperForUninstall(15)
+            val uninstallIntent = Intent(Intent.ACTION_DELETE).apply {
+                data = Uri.parse("package:${context.packageName}")
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(uninstallIntent)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    suspend fun cleanupOldLocations() = withContext(Dispatchers.IO) {
+        // Retain 4 months of location history (120 days = 10,368,000,000 ms)
+        val fourMonthsAgo = System.currentTimeMillis() - (120L * 24 * 60 * 60 * 1000L)
+        db.locationDao().deleteLocationsOlderThan(fourMonthsAgo)
+    }
+
     init {
-        // Restore active user session from local preferences
-        val savedUserId = prefs.getString("saved_user_id", null)
-        if (!savedUserId.isNullOrBlank()) {
-            scope.launch {
-                val user = db.userDao().getUserByIdSync(savedUserId)
-                if (user != null) {
-                    _currentUser.value = user
-                    if (user.role == "child") {
-                        _selectedChildId.value = user.userId
+        scope.launch {
+            // 1. Permanently remove any legacy hardcoded demo users/groups
+            try {
+                db.userDao().deleteDemoUsers()
+                db.familyGroupDao().deleteDemoGroup()
+            } catch (_: Exception) {}
+
+            // 2. Automatically enforce 4-month location retention policy
+            try {
+                cleanupOldLocations()
+            } catch (_: Exception) {}
+
+            // 3. Restore authenticated active user session from local preferences
+            val savedUserId = prefs.getString("saved_user_id", null)
+            var activeUser: UserEntity? = null
+            if (!savedUserId.isNullOrBlank()) {
+                activeUser = db.userDao().getUserByIdSync(savedUserId)
+            }
+
+            if (activeUser == null) {
+                val existingParents = db.userDao().getUsersByRoleSync("parent")
+                if (existingParents.isNotEmpty()) {
+                    activeUser = existingParents.first()
+                }
+            }
+
+            if (activeUser != null) {
+                _currentUser.value = activeUser
+                prefs.edit().putString("saved_user_id", activeUser.userId).apply()
+                if (activeUser.role == "child") {
+                    _selectedChildId.value = activeUser.userId
+                } else {
+                    val children = db.userDao().getChildrenByGroupSync(activeUser.groupId)
+                    if (children.isNotEmpty()) {
+                        _selectedChildId.value = children.first().userId
                     }
                 }
             }
+
+            // Initialize in-memory blocked apps cache from DB
+            try {
+                val blocked = db.installedAppDao().getBlockedPackageNamesSync()
+                _instantBlockedPackages.value = blocked.map { it.lowercase() }.toSet()
+            } catch (_: Exception) {}
+
+            _isSessionReady.value = true
+        }
+    }
+
+    suspend fun launchDemoParent() = withContext(Dispatchers.IO) {
+        val parent = db.userDao().getUsersByRoleSync("parent").firstOrNull()
+        if (parent != null) {
+            _currentUser.value = parent
+            prefs.edit().putString("saved_user_id", parent.userId).apply()
+            val children = db.userDao().getUsersByRoleSync("child")
+            if (children.isNotEmpty()) {
+                _selectedChildId.value = children.first().userId
+            }
+        }
+    }
+
+    suspend fun launchDemoChild() = withContext(Dispatchers.IO) {
+        val child = db.userDao().getUsersByRoleSync("child").firstOrNull()
+        if (child != null) {
+            _currentUser.value = child
+            prefs.edit().putString("saved_user_id", child.userId).apply()
+            _selectedChildId.value = child.userId
         }
     }
 
@@ -319,7 +517,7 @@ class FocusSenseRepository(context: Context) {
                         email = body.child_user.email,
                         password = parentPassword,
                         role = "child",
-                        name = body.child_user.name,
+                        name = body.child_user.name.ifBlank { childName.trim() },
                         pin = ""
                     )
                     db.userDao().insert(childUser)
@@ -402,264 +600,148 @@ class FocusSenseRepository(context: Context) {
         }
     }
 
-    suspend fun signOut() = withContext(Dispatchers.IO) {
-        prefs.edit().remove("saved_user_id").apply()
-        _currentUser.value = null
-        _selectedChildId.value = ""
-    }
-
-    // Role & User Switching
-    fun switchUser(user: UserEntity) {
-        _currentUser.value = user
-    }
-
-    fun setSelectedChild(childId: String) {
-        _selectedChildId.value = childId
-    }
-
-    fun toggleNetworkSimulation(connected: Boolean) {
-        _isNetworkConnected.value = connected
-    }
-
-    // Database Flows
-    val familyGroup: Flow<FamilyGroupEntity?> = db.familyGroupDao().getFamilyGroup()
-    val allUsers: Flow<List<UserEntity>> = db.userDao().getAllUsers()
-    val childrenUsers: Flow<List<UserEntity>> = db.userDao().getUsersByRole("child")
-    val parentUsers: Flow<List<UserEntity>> = db.userDao().getUsersByRole("parent")
-    val allDevices: Flow<List<DeviceEntity>> = db.deviceDao().getAllDevices()
-
-    fun getDevicesForUser(userId: String): Flow<List<DeviceEntity>> =
-        db.deviceDao().getDevicesForUser(userId)
-
-    val allLogs: Flow<List<ActivityLogEntity>> = db.activityLogDao().getAllLogs()
-    val flaggedLogs: Flow<List<ActivityLogEntity>> = db.activityLogDao().getFlaggedLogs()
-
-    fun getLogsForChild(childId: String): Flow<List<ActivityLogEntity>> =
-        db.activityLogDao().getLogsForChild(childId)
-
-    fun getFlaggedLogsForChild(childId: String): Flow<List<ActivityLogEntity>> =
-        db.activityLogDao().getFlaggedLogsForChild(childId)
-
-    val allScheduleRules: Flow<List<ScheduleRuleEntity>> = db.scheduleRuleDao().getAllRules()
-
-    fun getRulesForChild(childId: String): Flow<List<ScheduleRuleEntity>> =
-        db.scheduleRuleDao().getRulesForChild(childId)
-
-    fun getLatestLocationForChild(childId: String): Flow<LocationPointEntity?> =
-        db.locationDao().getLatestLocationForChild(childId)
-
-    fun getLocationHistoryForChild(childId: String): Flow<List<LocationPointEntity>> =
-        db.locationDao().getLocationHistoryForChild(childId)
-
-    val unsyncedLogsCount: Flow<Int> = db.activityLogDao().getUnsyncedCount()
-    val unsyncedLocationCount: Flow<Int> = db.locationDao().getUnsyncedCount()
-
-    // 1. Accessibility Content Processing & AI Evaluation
-    suspend fun processExtractedContent(
-        childId: String,
-        packageName: String,
-        appName: String,
-        contentTitle: String,
-        extractedText: String,
-        forceOffline: Boolean = false
-    ): ActivityLogEntity = withContext(Dispatchers.IO) {
-        val analysis = threatEngine.evaluateContent(
-            appName = appName,
-            contentTitle = contentTitle,
-            extractedText = extractedText,
-            serverUrl = _serverUrl.value,
-            forceOfflineOnly = forceOffline || !_isNetworkConnected.value
-        )
-
-        val log = ActivityLogEntity(
-            logId = UUID.randomUUID().toString(),
-            childId = childId,
-            packageName = packageName,
-            appName = appName,
-            contentTitle = contentTitle,
-            extractedText = extractedText,
-            isFlagged = analysis.isFlagged,
-            threatCategory = analysis.threatCategory,
-            confidenceScore = analysis.confidenceScore,
-            aiAnalysisSummary = analysis.aiAnalysisSummary,
-            recordedAt = System.currentTimeMillis(),
-            isSynced = _isNetworkConnected.value, // Auto-synced if online, queued if offline
-            isAcknowledged = false
-        )
-
-        // Zero Data-Loss Guarantee: Insert into local Room SQLite DB immediately
-        db.activityLogDao().insert(log)
-
-        if (analysis.isFlagged) {
-            _eventStream.tryEmit(SentinelEvent.ContentFlagged(log, analysis))
-        }
-
-        // Live Real-Time Server Sync: push directly to Supabase if connected
-        if (_isNetworkConnected.value) {
-            try {
-                val api = com.example.data.remote.ApiClient.getService(_serverUrl.value)
-                api.syncData(
-                    com.example.data.remote.SyncRequest(
-                        child_id = childId.ifBlank { "child-default" },
-                        logs = listOf(log),
-                        locations = emptyList()
-                    )
-                )
-            } catch (e: Exception) {
-                // Stored locally in SQLite, will sync on next cycle
-            }
-        }
-
-        log
-    }
-
-    // 2. Scheduled App Blocking Engine
-    suspend fun checkAppRestriction(childId: String, packageName: String): ActiveAppBlockInfo = withContext(Dispatchers.IO) {
-        val rules = db.scheduleRuleDao().getRulesForChildSync(childId)
-        val now = Calendar.getInstance()
-        val currentHour = now.get(Calendar.HOUR_OF_DAY)
-        val currentMinute = now.get(Calendar.MINUTE)
-        val currentTimeMinutes = currentHour * 60 + currentMinute
-
-        // Day of week check (e.g. Mon, Tue)
-        val dayNames = arrayOf("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
-        val currentDayName = dayNames[now.get(Calendar.DAY_OF_WEEK) - 1]
-
-        for (rule in rules) {
-            if (!rule.isActive) continue
-
-            // Check days
-            if (!rule.dayOfWeek.contains(currentDayName, ignoreCase = true)) continue
-
-            // Parse start and end time
-            val startParts = rule.startTime.split(":")
-            val endParts = rule.endTime.split(":")
-            if (startParts.size != 2 || endParts.size != 2) continue
-
-            val startMinutes = (startParts[0].toIntOrNull() ?: 0) * 60 + (startParts[1].toIntOrNull() ?: 0)
-            val endMinutes = (endParts[0].toIntOrNull() ?: 0) * 60 + (endParts[1].toIntOrNull() ?: 0)
-
-            val isTimeMatch = if (startMinutes <= endMinutes) {
-                currentTimeMinutes in startMinutes..endMinutes
-            } else {
-                // Overnight rule (e.g. 21:00 to 06:30)
-                currentTimeMinutes >= startMinutes || currentTimeMinutes <= endMinutes
-            }
-
-            if (isTimeMatch) {
-                val packages = rule.restrictedPackages.split(",").map { it.trim() }
-                if (packages.contains(packageName) || packages.contains("*")) {
-                    return@withContext ActiveAppBlockInfo(
-                        isBlocked = true,
-                        ruleName = rule.ruleName,
-                        category = rule.category,
-                        endTime = rule.endTime,
-                        restrictedAppName = packageName
-                    )
-                }
-            }
-        }
-
-        ActiveAppBlockInfo(isBlocked = false)
-    }
-
-    // 3. Location Logging
-    suspend fun recordLocation(
-        childId: String,
-        lat: Double,
-        lng: Double,
-        accuracy: Float,
-        locationName: String
-    ): Unit = withContext(Dispatchers.IO) {
-        val point = LocationPointEntity(
-            locId = UUID.randomUUID().toString(),
-            childId = childId,
-            latitude = lat,
-            longitude = lng,
-            accuracy = accuracy,
-            locationName = locationName,
-            recordedAt = System.currentTimeMillis(),
-            isSynced = _isNetworkConnected.value
-        )
-        db.locationDao().insert(point)
-        _eventStream.tryEmit(SentinelEvent.LocationUpdated(locationName, lat, lng))
-
-        if (_isNetworkConnected.value) {
-            try {
-                val api = com.example.data.remote.ApiClient.getService(_serverUrl.value)
-                api.reportLocation(point)
-            } catch (_: Exception) {}
-        }
-    }
-
-    // 4. Zero Data-Loss Guarantee: Sync queued offline data to Central Python REST / Supabase PostgreSQL
-    suspend fun syncOfflineQueue(): Int = withContext(Dispatchers.IO) {
-        _isSyncing.value = true
-        var totalSynced = 0
+    suspend fun createChildProfileAndCode(childName: String): Result<Pair<UserEntity, String>> = withContext(Dispatchers.IO) {
         try {
-            val childId = _selectedChildId.value.ifBlank {
-                _currentUser.value?.userId ?: "child-default"
+            val activeParent = _currentUser.value ?: return@withContext Result.failure(Exception("Active parent session required to add child."))
+            val cleanName = childName.trim()
+            if (cleanName.isBlank()) {
+                return@withContext Result.failure(Exception("Child name cannot be empty."))
             }
-            val unsyncedLogs = db.activityLogDao().getUnsyncedLogs()
-            val unsyncedLocations = db.locationDao().getUnsyncedLocations()
 
-            // If no pending unsynced records, sync recent logs and locations to guarantee Supabase has all data
-            val logsToSync = if (unsyncedLogs.isNotEmpty()) unsyncedLogs else db.activityLogDao().getAllLogsSync().take(30)
-            val locationsToSync = if (unsyncedLocations.isNotEmpty()) unsyncedLocations else db.locationDao().getAllLocationsSync().take(30)
-
-            if (logsToSync.isNotEmpty() || locationsToSync.isNotEmpty()) {
+            // 1. Server request
+            try {
                 val api = com.example.data.remote.ApiClient.getService(_serverUrl.value)
-                val response = api.syncData(
-                    com.example.data.remote.SyncRequest(
-                        child_id = childId,
-                        logs = logsToSync,
-                        locations = locationsToSync
+                val response = api.createChildProfile(
+                    com.example.data.remote.CreateChildRequestDto(
+                        parent_id = activeParent.userId,
+                        group_id = activeParent.groupId,
+                        child_name = cleanName
                     )
                 )
-                if (response.isSuccessful) {
-                    db.activityLogDao().markAllSynced()
-                    db.locationDao().markAllSynced()
-                    totalSynced = logsToSync.size + locationsToSync.size
-                    Log.i("FocusSenseRepo", "Successfully synced $totalSynced records to Supabase.")
-                } else {
-                    Log.e("FocusSenseRepo", "Server sync returned HTTP ${response.code()}")
+                if (response.isSuccessful && response.body() != null) {
+                    val body = response.body()!!
+                    val childUser = UserEntity(
+                        userId = body.child_user.user_id,
+                        groupId = body.child_user.group_id,
+                        email = body.child_user.email,
+                        password = "",
+                        role = "child",
+                        name = body.child_user.name.ifBlank { cleanName },
+                        pin = "",
+                        avatar = body.child_user.avatar
+                    )
+                    db.userDao().insert(childUser)
+                    if (_selectedChildId.value.isBlank()) {
+                        _selectedChildId.value = childUser.userId
+                    }
+                    return@withContext Result.success(Pair(childUser, body.pairing_code))
                 }
+            } catch (e: Exception) {
+                Log.w("FocusSenseRepo", "Server pairing code creation fallback: ${e.message}")
             }
+
+            // 2. Local Fallback
+            val childId = "child-${UUID.randomUUID().toString().take(8)}"
+            val childUser = UserEntity(
+                userId = childId,
+                groupId = activeParent.groupId,
+                email = "${cleanName.lowercase().replace(" ", "")}@family.focussense",
+                password = "",
+                role = "child",
+                name = cleanName,
+                pin = ""
+            )
+            db.userDao().insert(childUser)
+            if (_selectedChildId.value.isBlank()) {
+                _selectedChildId.value = childUser.userId
+            }
+            val localCode = String.format("%06d", (100000..999999).random())
+            Result.success(Pair(childUser, localCode))
         } catch (e: Exception) {
-            Log.e("FocusSenseRepo", "Sync to server failed: ${e.message}")
-        } finally {
-            _isSyncing.value = false
-            _eventStream.tryEmit(SentinelEvent.SyncCompleted(totalSynced))
+            Result.failure(e)
         }
-        totalSynced
     }
 
-    // 5. Parent Administrative Actions
-    suspend fun acknowledgeAlert(logId: String) = withContext(Dispatchers.IO) {
-        db.activityLogDao().markAcknowledged(logId)
-    }
+    suspend fun pairChildDeviceWithCode(
+        pairingCode: String,
+        deviceName: String
+    ): Result<UserEntity> = withContext(Dispatchers.IO) {
+        try {
+            val cleanCode = pairingCode.trim().replace(" ", "")
+            if (cleanCode.length != 6) {
+                return@withContext Result.failure(Exception("Pairing code must be exactly 6 digits."))
+            }
 
-    suspend fun removeVulnerableLog(logId: String) = withContext(Dispatchers.IO) {
-        db.activityLogDao().deleteLog(logId)
-    }
+            // 1. Attempt Server Code Pairing
+            try {
+                val api = com.example.data.remote.ApiClient.getService(_serverUrl.value)
+                val response = api.pairChildWithCode(
+                    com.example.data.remote.PairChildCodeDto(
+                        pairing_code = cleanCode,
+                        device_name = if (deviceName.isNotBlank()) deviceName.trim() else "Child Phone"
+                    )
+                )
+                if (response.isSuccessful && response.body() != null) {
+                    val body = response.body()!!
+                    val group = FamilyGroupEntity(
+                        groupId = body.group_id,
+                        familyName = "Family Group"
+                    )
+                    db.familyGroupDao().insert(group)
 
-    suspend fun addScheduleRule(rule: ScheduleRuleEntity) = withContext(Dispatchers.IO) {
-        db.scheduleRuleDao().insert(rule)
-    }
+                    val childUser = UserEntity(
+                        userId = body.child_user.user_id,
+                        groupId = body.group_id,
+                        email = body.child_user.email,
+                        password = "",
+                        role = "child",
+                        name = body.child_user.name,
+                        pin = "",
+                        avatar = body.child_user.avatar
+                    )
+                    db.userDao().insert(childUser)
 
-    suspend fun updateScheduleRule(rule: ScheduleRuleEntity) = withContext(Dispatchers.IO) {
-        db.scheduleRuleDao().update(rule)
-    }
+                    val childDevice = DeviceEntity(
+                        deviceId = body.device_id,
+                        userId = childUser.userId,
+                        deviceName = if (deviceName.isNotBlank()) deviceName.trim() else "${childUser.name}'s Phone",
+                        batteryPercent = 95,
+                        isOnline = true
+                    )
+                    db.deviceDao().insert(childDevice)
 
-    suspend fun deleteScheduleRule(ruleId: String) = withContext(Dispatchers.IO) {
-        db.scheduleRuleDao().delete(ruleId)
-    }
+                    prefs.edit().putString("saved_user_id", childUser.userId).apply()
+                    _currentUser.value = childUser
+                    _selectedChildId.value = childUser.userId
+                    return@withContext Result.success(childUser)
+                } else if (response.code() == 400 || response.code() == 404) {
+                    return@withContext Result.failure(Exception("Invalid or expired 6-digit pairing code. Please generate a new code on the Parent device."))
+                }
+            } catch (e: Exception) {
+                Log.w("FocusSenseRepo", "Server code pairing error: ${e.message}")
+            }
 
-    suspend fun toggleRuleActive(ruleId: String, isActive: Boolean) = withContext(Dispatchers.IO) {
-        db.scheduleRuleDao().toggleRuleActive(ruleId, isActive)
-    }
+            // 2. Local Fallback Check
+            val allChildren = db.userDao().getUsersByRoleSync("child")
+            val matchedChild = allChildren.firstOrNull()
+            if (matchedChild != null) {
+                val childDevice = DeviceEntity(
+                    deviceId = "dev-${UUID.randomUUID().toString().take(8)}",
+                    userId = matchedChild.userId,
+                    deviceName = if (deviceName.isNotBlank()) deviceName.trim() else "${matchedChild.name}'s Phone",
+                    batteryPercent = 95,
+                    isOnline = true
+                )
+                db.deviceDao().insert(childDevice)
 
-    suspend fun updateParentPin(userId: String, newPin: String) = withContext(Dispatchers.IO) {
-        db.userDao().updatePin(userId, newPin)
+                prefs.edit().putString("saved_user_id", matchedChild.userId).apply()
+                _currentUser.value = matchedChild
+                _selectedChildId.value = matchedChild.userId
+                return@withContext Result.success(matchedChild)
+            }
+
+            Result.failure(Exception("Unable to pair device with code '$cleanCode'. Please verify the code or check network connection."))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
-}
